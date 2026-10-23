@@ -27,6 +27,7 @@ application, GTK or private host modules. use Rust `1.98.1`:
 ```sh
 cargo +1.98.1 fmt --all --check
 cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+cargo +1.98.1 build --locked --example managed-status
 cargo +1.98.1 test --locked --all-targets
 cargo +1.98.1 build --release --locked --bins
 ```
@@ -49,7 +50,13 @@ original code is Apache-2.0; see [LICENSE](LICENSE), [NOTICE](NOTICE) and the
 unchanged [upstream notice](provenance/among-NOTICE). dependency licence/source
 delivery for future binary packages needs its own complete inventory.
 
-managed API 1.2 ports, scoped grants/targets, timezone parity, static manifests,
+the shared [managed status transport](docs/managed-status.md) is under development.
+its separate process fixture consumes admission, grants and correlated bounded
+stdio; it is not an installable official plugin. the three production binaries
+still use their unchanged legacy protocol. real managed-host admission remains
+an open acceptance requirement, not established by the fixture's host driver.
+
+production API 1.2 ports, timezone parity, static manifests,
 catalogue/artifact validation, release automation and real host lifecycle checks
 are not implemented by this extraction. no tag, release or package publication
 is performed by its quality workflow.

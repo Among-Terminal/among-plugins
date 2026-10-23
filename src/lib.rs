@@ -2,6 +2,7 @@
 
 pub mod clock;
 pub mod install;
+pub mod managed;
 pub mod protocol;
 pub mod pwd;
 pub mod system;
