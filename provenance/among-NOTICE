@@ -1,0 +1,7 @@
+Among Terminal
+Original project code and example plugins are licensed under Apache-2.0.
+
+Third-party Rust dependencies retain their own licenses and attribution in
+THIRD_PARTY/inventory.json and THIRD_PARTY/texts/. Native GTK, libadwaita, VTE
+and their dependencies are separately licensed; see docs/licensing.md.
+This notice does not relicense third-party components.
