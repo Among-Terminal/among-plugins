@@ -34,3 +34,14 @@ or user-facing binary package is distributed by this source-only import.
 the host still retains its original implementations and payloads until a reviewed,
 observed upgrade-retention gate permits cutover. this temporary staging copy is
 not a second supported production distribution or an automatic migration.
+
+## later managed transport work
+
+`src/managed/wire.rs` adapts the duplicate-key visitor and string-aware depth
+scan from Apache-2.0 Among's `src/plugin/data.rs` and `src/plugin/transport.rs`
+at public integration commit
+[`5d0d00e6cc5aa0529969b9d0bdbc2cc00b15361c`](https://github.com/Among-Terminal/among/commit/5d0d00e6cc5aa0529969b9d0bdbc2cc00b15361c).
+the wire contract follows that commit's managed runtime and plugin guide. this
+adaptation is not part of the unchanged initial 19-file extraction manifest;
+the original licence and notice remain applicable. it adds no host-source build
+dependency or authority to publish a managed release.

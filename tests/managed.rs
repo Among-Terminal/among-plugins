@@ -364,9 +364,17 @@ fn managed_context_refusals_do_not_call_or_reply_and_unavailable_stays_null() {
     cases.push(value);
     let mut value = base.clone();
     value["terminals"][0]["cwd"] = json!("x".repeat(4097));
+    value["terminals"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("unavailable");
     cases.push(value);
     let mut value = base.clone();
     value["terminals"][0]["cwd"] = json!("\u{1}".repeat(1400));
+    value["terminals"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("unavailable");
     cases.push(value);
     let mut value = base.clone();
     value["terminals"][0]["unavailable"] = json!(["title"]);
@@ -428,6 +436,10 @@ fn managed_context_refusals_do_not_call_or_reply_and_unavailable_stays_null() {
     greeting["features"] = json!(["status", "context.terminals"]);
     let mut request = status(1);
     request["context"] = base.clone();
+    request["context"]["terminals"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("unavailable");
     let mut output = Vec::new();
     assert!(managed::serve(
         &profile,
@@ -438,16 +450,40 @@ fn managed_context_refusals_do_not_call_or_reply_and_unavailable_stays_null() {
     .is_err());
     assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
     greeting["features"] = json!(["status", "context.terminals", "context.cwd"]);
+    request["context"] = base.clone();
+    let mut called = 0;
     managed::serve(
         &profile,
         format!("{greeting}\n{request}\n").as_bytes(),
         Vec::new(),
         |_, context| {
+            called += 1;
             assert!(context["terminals"][0]["cwd"].is_null());
             Status::empty(None)
         },
     )
     .unwrap();
+    assert_eq!(called, 1);
+    for path in ["x".repeat(4096), "\u{1}".repeat(1365)] {
+        request["context"]["terminals"][0]["cwd"] = json!(path);
+        request["context"]["terminals"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("unavailable");
+        let mut called = 0;
+        managed::serve(
+            &profile,
+            format!("{greeting}\n{request}\n").as_bytes(),
+            Vec::new(),
+            |_, context| {
+                called += 1;
+                assert_eq!(context["terminals"][0]["cwd"], path);
+                Status::empty(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(called, 1);
+    }
 }
 
 #[test]
