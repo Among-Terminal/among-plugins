@@ -32,14 +32,16 @@ cargo +1.98.1 build --release --locked --bins
 ```
 
 the native amd64/arm64 workflow runs those commands. tests retain real process
-stdio, advancing local/TZ time, pane-specific directories and resource readings
-alongside refusal/fixture controls. these are legacy process/package tests, not
-proof of managed host admission or graphical status output.
+stdio, advancing local/TZ time and pane-specific directories, plus fixture-based
+resource calculations and initial N/A/target-refusal checks. they do not validate
+live CPU/MEM/DISK measurements, managed host admission or graphical status output.
 
 `examples/install.rs` is retained legacy code for provenance and regression
 coverage, not the future repository installer or an instruction to modify a
 personal profile. new managed installation, access review and enablement must
 remain explicit; discovery must not start a process.
+its unchanged help text still names the upstream `scripts/install-plugins.sh`,
+which is absent here; it is not a supported standalone installation entry point.
 
 ## licence and remaining work
 
