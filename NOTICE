@@ -1,0 +1,11 @@
+among-plugins
+original project code and examples are licensed under Apache-2.0.
+
+the original sources were extracted from Among Terminal. their unchanged
+upstream notice is retained in provenance/among-NOTICE; its distribution paths
+describe the upstream application, not this standalone source snapshot.
+
+Cargo.lock records independently licensed dependencies. their source is not
+vendored here. future binary redistribution requires applicable dependency
+notices and source delivery; this file is not a completed binary-package audit
+and does not relicense third-party components.

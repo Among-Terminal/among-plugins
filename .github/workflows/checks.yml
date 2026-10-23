@@ -1,0 +1,50 @@
+name: Locked Rust source checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            kernel: x86_64
+            rust_host: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            kernel: aarch64
+            rust_host: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '1'
+      EXPECTED_KERNEL: ${{ matrix.kernel }}
+      EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Require the native build architecture
+        run: |
+          test "$(uname -m)" = "$EXPECTED_KERNEL"
+      - name: Install the pinned Rust tools
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      - name: Bind the actual compiler host
+        run: |
+          rustc +1.98.1 --version --verbose
+          test "$(rustc +1.98.1 --version --verbose | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
+      - name: Format
+        run: cargo +1.98.1 fmt --all --check
+      - name: Clippy
+        run: cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+      - name: Original unit and process tests
+        run: cargo +1.98.1 test --locked --all-targets
+      - name: Standalone legacy binary build
+        run: cargo +1.98.1 build --release --locked --bins
