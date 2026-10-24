@@ -19,6 +19,10 @@ name = "clock"
 path = "src/bin/clock.rs"
 
 [[bin]]
+name = "clock-managed"
+path = "src/bin/clock-managed.rs"
+
+[[bin]]
 name = "system-status"
 path = "src/bin/system-status.rs"
 
