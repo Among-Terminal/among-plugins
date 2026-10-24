@@ -6,9 +6,11 @@ the independent source home being prepared for Among's official `clock`,
 ## extraction baseline, not a managed release
 
 the original `clock`, `system-status` and `pane-pwd` entrypoints preserve their
-legacy hello 1.0 behavior and regression tests. `clock-managed` is a separate
-production API 1.2 entrypoint using the same clock renderer, not a protocol
-fixture or a fallback mode. see [clock contracts](docs/clock.md).
+legacy hello 1.0 behavior and regression tests. `clock-managed` and
+`system-status-managed` are explicit production API 1.2 entrypoints using the same
+clock renderer and resource sampler as their legacy counterparts, not protocol
+fixtures or fallback modes. see [clock](docs/clock.md) and
+[resource contracts](docs/system-status.md).
 there is no installable managed catalogue or release in this snapshot.
 
 the retained crate name `among-example-plugins` and version `0.1.2` identify the
@@ -33,14 +35,18 @@ cargo +1.98.1 test --locked --all-targets
 cargo +1.98.1 build --release --locked --bins
 ```
 
-the native amd64/arm64 workflow runs those commands, including both clock
-entrypoints. unchanged legacy tests retain real stdio, advancing local/TZ time,
+the native amd64/arm64 workflow runs those commands, including both explicit
+entrypoints for clock and system-status. unchanged legacy tests retain real stdio,
+advancing local/TZ time,
 pane-specific directories, resource calculations and initial N/A/target refusal.
 new clock tests target the actual `clock-managed` executable, strict admission,
 correlation, real time advancement and timezone behavior relative to the legacy
 renderer. writing those tests is not evidence that they have passed: current-head
-CI and actual host timezone integration remain separate acceptance gates. these
-tests do not establish live CPU/MEM/DISK measurements or graphical status output.
+CI and actual host integration remain separate acceptance gates. new resource
+tests compare actual production CPU/MEM/root-DISK output against independent
+readings, with bounded observation skew, and test per-source N/A/rate behavior
+separately. graphical meters, authenticated installation and whole managed-host
+lifecycle are not established by these client tests.
 
 `examples/install.rs` is retained legacy code for provenance and regression
 coverage, not the future repository installer or an instruction to modify a
@@ -57,13 +63,14 @@ delivery for future binary packages needs its own complete inventory.
 
 the shared [managed status transport](docs/managed-status.md) supplies strict
 admission, grants and correlated bounded stdio. its `managed-status` example is
-still only a protocol fixture. `clock-managed` consumes that transport and the
-real clock renderer; the three legacy entrypoints remain separate. neither the
-fixture's host driver nor client-only clock tests establish production host
+still only a protocol fixture. the two managed production entrypoints consume
+that transport and the existing renderers; legacy entrypoints remain separate.
+neither the fixture's host driver nor client-only clock tests establish production host
 timezone parity or authenticated installation.
 
 remaining API 1.2 ports, host timezone parity, static manifests, catalogue/artifact
 validation, release automation and real installed lifecycle checks are separate
-work. future clock packages must explicitly select `clock-managed`, never infer
-the legacy `clock` executable from its plugin id or silently fall back. no tag,
-release or package publication is performed by this quality workflow.
+work. future packages must explicitly select `clock-managed` or
+`system-status-managed` for those managed entries, never infer a legacy executable
+from its plugin id or silently fall back. no tag, release or package publication
+is performed by this quality workflow.
