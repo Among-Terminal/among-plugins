@@ -42,6 +42,9 @@ targets permit pane_header/footer. non-application scopes require terminal acces
 context must match the admitted session. without terminal access only the session
 is allowed. pages have at most 32 terminals and 28 KiB of encoded terminal data.
 terminal references must be canonical, unique and within the requested target.
+active_workspace and focused_pane are application-only metadata; their presence
+in pane/workspace context refuses, including null rather than just noncanonical
+or sibling references.
 cwd is absent without its grant; an authorized unavailable cwd remains null, not
 a fabricated path. paths exceeding 4096 UTF-8 or 8192 encoded bytes refuse rather
 than truncate. sibling data and undeclared terminal fields refuse before callback.

@@ -535,3 +535,77 @@ fn managed_profile_validation_and_pipe_errors_are_not_false_success() {
         std::io::ErrorKind::BrokenPipe
     );
 }
+
+#[test]
+fn managed_global_focus_metadata_is_application_only() {
+    let profile = managed::Profile {
+        identity: "github:1431055733/protocol-fixture",
+        required: &["status"],
+        optional: &["context.terminals"],
+    };
+    let mut greeting = hello();
+    greeting["features"] = json!(["status", "context.terminals"]);
+    let context = json!({"session":"session-one","terminals":[{"pane":"1","workspace":"10"}],"next_cursor":null});
+    for (field, reference) in [("active_workspace", "20"), ("focused_pane", "2")] {
+        for value in [json!(reference), Value::Null] {
+            for scope in [
+                json!({"slot":"pane_footer","target":{"kind":"pane","reference":"1"}}),
+                json!({"slot":"workspace_summary","target":{"kind":"workspace","reference":"10"}}),
+            ] {
+                let mut request = status(1);
+                request["scope"] = scope.clone();
+                request["context"] = context.clone();
+                request["context"][field] = value.clone();
+                let mut called = 0;
+                let mut output = Vec::new();
+                assert!(managed::serve(
+                    &profile,
+                    format!("{greeting}\n{request}\n").as_bytes(),
+                    &mut output,
+                    |_, _| {
+                        called += 1;
+                        Status::empty(None)
+                    }
+                )
+                .is_err());
+                assert_eq!(called, 0, "{field} must not leak through {scope}");
+                assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
+
+                // the same scope without the global field must still execute;
+                // rejection above cannot be borrowed from malformed target data.
+                request["context"] = context.clone();
+                let mut called = 0;
+                managed::serve(
+                    &profile,
+                    format!("{greeting}\n{request}\n").as_bytes(),
+                    Vec::new(),
+                    |_, _| {
+                        called += 1;
+                        Status::empty(None)
+                    },
+                )
+                .unwrap();
+                assert_eq!(called, 1);
+            }
+
+            let mut request = status(1);
+            request["context"] = context.clone();
+            request["context"][field] = value.clone();
+            let mut called = 0;
+            let mut output = Vec::new();
+            managed::serve(
+                &profile,
+                format!("{greeting}\n{request}\n").as_bytes(),
+                &mut output,
+                |_, received| {
+                    called += 1;
+                    assert_eq!(received[field], value);
+                    Status::empty(None)
+                },
+            )
+            .unwrap();
+            assert_eq!(called, 1);
+            assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 2);
+        }
+    }
+}

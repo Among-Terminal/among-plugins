@@ -166,6 +166,11 @@ fn context_valid(context: &Value, scope: &Scope, admission: &Admission) -> bool 
     if !admission.features.contains("context.terminals") {
         return context.as_object().is_some_and(|object| object.len() == 1);
     }
+    if scope.target != Target::Application
+        && (context.get("active_workspace").is_some() || context.get("focused_pane").is_some())
+    {
+        return false;
+    }
     let Some(terminals) = context.get("terminals").and_then(Value::as_array) else {
         return false;
     };
