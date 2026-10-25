@@ -1,27 +1,23 @@
 # among-plugins
 
-official status plugins for [Among Terminal](https://github.com/Among-Terminal/among),
+official plugins for [Among Terminal](https://github.com/Among-Terminal/among),
 built as standalone Rust processes without linking the application or GTK.
 
-[plugins](#plugins) · [getting started](#getting-started) · [development](#development) · [licence](#licence-and-provenance)
+[catalogue](#catalogue) · [getting started](#getting-started) · [development](#development) · [licence](#licence-and-provenance)
 
-## plugins
+## catalogue
 
-- **clock** — local time in the application footer, formatted as `HH:MM:SS`.
-- **system-status** — CPU, memory and root-filesystem usage in the application
-  header on Linux; unavailable measurements appear as `N/A`.
-- **pane-pwd** — the working directory supplied by Among for each pane, shown
-  in that pane's footer.
+| plugin | purpose | entrypoints | documentation |
+| --- | --- | --- | --- |
+| clock | local time in the application footer (`HH:MM:SS`) | `clock` — legacy 1.0; `clock-managed` — managed API 1.2 | [contract and timezone limits](docs/clock.md) |
+| system-status | Linux CPU, memory and root-filesystem usage in the application header; unavailable measurements show `N/A` | `system-status` — legacy 1.0; managed port not yet included | — |
+| pane-pwd | working directory supplied by Among for each pane, displayed in its footer | `pane-pwd` — legacy 1.0; managed port not yet included | — |
 
-the `clock`, `system-status` and `pane-pwd` binaries retain the legacy 1.0
-protocol. `clock-managed` is a separate managed API 1.2 entrypoint sharing the
-clock renderer; it never falls back to the legacy protocol. managed ports of
-system-status and pane-pwd are not included yet.
-
-see the [clock contract](docs/clock.md) for entrypoint selection and timezone
-integration limits, and the [managed transport contract](docs/managed-status.md)
-for admission, permissions and stdio framing. the `managed-status` example is
-a protocol test fixture, not a fourth plugin.
+each plugin has one catalogue entry covering its purpose, available entrypoints
+and documentation. add new plugins here rather than maintaining separate lists.
+legacy and managed entrypoints use different protocols; managed entrypoints do
+not fall back to legacy. see the [managed transport contract](docs/managed-status.md)
+for admission, permissions and stdio framing.
 
 ## getting started
 
@@ -51,7 +47,8 @@ cargo +1.98.1 test --locked --all-targets
 cargo +1.98.1 build --release --locked --bins
 ```
 
-the example build is required before the process tests. CI runs these checks
+the example is a protocol test fixture, not a catalogue plugin; its build is
+required before the process tests. CI runs these checks
 on native Linux amd64 and arm64; release binaries are written to `target/release/`.
 the tests cover plugin-side behavior, not installed lifecycle or graphical host
 integration. no Among checkout or private SDK is needed to build this package.
