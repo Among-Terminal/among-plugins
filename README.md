@@ -11,7 +11,7 @@ built as standalone Rust processes without linking the application or GTK.
 | --- | --- | --- | --- |
 | clock | local time in the application footer (`HH:MM:SS`) | `clock` — legacy 1.0; `clock-managed` — managed API 1.2 | [contract and timezone limits](docs/clock.md) |
 | system-status | Linux CPU, memory and root-filesystem usage in the application header; unavailable measurements show `N/A` | `system-status` — legacy 1.0; `system-status-managed` — managed API 1.2 | [resource contract and namespace limits](docs/system-status.md) |
-| pane-pwd | working directory supplied by Among for each pane, displayed in its footer | `pane-pwd` — legacy 1.0; managed port not yet included | — |
+| pane-pwd | working directory supplied by Among for each pane, displayed in its footer | `pane-pwd` — legacy 1.0; `pane-pwd-managed` — managed API 1.2 initial-page adapter; SDK paging not yet included | [target, required access and paging limits](docs/pane-pwd.md) |
 
 each plugin has one catalogue entry covering its purpose, available entrypoints
 and documentation. add new plugins here rather than maintaining separate lists.

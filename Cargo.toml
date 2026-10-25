@@ -33,3 +33,7 @@ path = "src/bin/system-status-managed.rs"
 [[bin]]
 name = "pane-pwd"
 path = "src/bin/pane-pwd.rs"
+
+[[bin]]
+name = "pane-pwd-managed"
+path = "src/bin/pane-pwd-managed.rs"
