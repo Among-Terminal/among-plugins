@@ -11,7 +11,7 @@ pub(super) fn invalid() -> io::Error {
 }
 
 pub(super) fn read_frame(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-    let mut frame = Vec::new();
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES);
     loop {
         let available = input.fill_buf()?;
         if available.is_empty() {
@@ -93,7 +93,7 @@ impl Write for Frame {
 }
 
 pub(super) fn write_frame(output: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
-    let mut frame = Frame(Vec::new());
+    let mut frame = Frame(Vec::with_capacity(MAX_FRAME_BYTES));
     serde_json::to_writer(&mut frame, value).map_err(|_| invalid())?;
     if !bounded_depth(&frame.0) {
         return Err(invalid());
@@ -102,6 +102,28 @@ pub(super) fn write_frame(output: &mut impl Write, value: &impl Serialize) -> io
     frame.0.push(b'\n');
     output.write_all(&frame.0)?;
     output.flush()
+}
+
+pub(super) fn measure(value: &impl Serialize, limit: usize) -> io::Result<usize> {
+    struct Size {
+        bytes: usize,
+        limit: usize,
+    }
+    impl Write for Size {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(invalid());
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut size = Size { bytes: 0, limit };
+    serde_json::to_writer(&mut size, value).map_err(|_| invalid())?;
+    Ok(size.bytes)
 }
 
 struct Unique(Value);

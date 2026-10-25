@@ -25,7 +25,7 @@ share the known-path renderer: first 480 Unicode characters in the visible text,
 the entire accepted path in the tooltip, priority 10 and 1000-ms refresh. neither
 entrypoint sniffs or falls back to the other's protocol.
 
-## bounds and unfinished paging
+## bounds and SDK paging
 
 the shared transport limits cwd to 4096 UTF-8 bytes and 8192 JSON-encoded bytes,
 pages to 32 terminals/28 KiB, and frames to 64 KiB including newline. it rejects
@@ -34,10 +34,11 @@ value as null before it reaches this process; the display's 480-character cut is
 separate from these authority/transport bounds.
 
 a normal pane projection contains at most one terminal and needs no continuation.
-**shared SDK `enumerate`/`context_page` continuation is not implemented yet.** this
-initial-page adapter does not close the paging requirement: separate application/
-workspace continuation tests and an agreed missing-page/exhaustion policy remain
-required. it grants no application-wide access merely to manufacture pagination.
+the shared SDK's [page reducer and deadline-aware stdio](managed-paging.md) support
+application/workspace traversal independently. pane-pwd does not request broader
+access or enumerate siblings merely to manufacture a multi-page single-pane case.
+missing continuation/exhausted local budget fail closed/nonzero, not empty-success
+data. client process tests do not close real host/native/package acceptance.
 see the [shared transport contract](managed-status.md).
 
 `tests/managed_pwd.rs` exercises the actual entrypoint's stdio. these are client
