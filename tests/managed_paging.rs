@@ -293,6 +293,11 @@ fn real_sdk_missing_partial_and_unterminated_continuations_expire_with_stdin_ope
         child.enumerate(&target, 1);
         child.raw(partial);
         child.exited(false);
+        println!(
+            "sdk_traversal_expiry partial_bytes={} elapsed_ms={} stdin_open=true",
+            partial.len(),
+            started.elapsed().as_millis()
+        );
         assert!(started.elapsed() >= Duration::from_millis(3500));
         assert!(started.elapsed() < Duration::from_millis(5500));
         assert!(child.input.is_some(), "EOF is not the timeout witness");
@@ -315,6 +320,10 @@ fn real_sdk_absolute_budget_is_not_renewed_by_successful_progress() {
     child.send(page(&first, context(None, 2, 1, Some(2), false)));
     child.enumerate(&target, 2);
     child.exited(false);
+    println!(
+        "sdk_traversal_absolute_deadline elapsed_ms={} progress_did_not_renew=true",
+        started.elapsed().as_millis()
+    );
     assert!(started.elapsed() >= Duration::from_millis(3500));
     assert!(started.elapsed() < Duration::from_millis(5500));
 }
@@ -444,4 +453,159 @@ fn real_sdk_encoded_state_is_refused_before_enumeration() {
     child.admit();
     child.send(status(7, scope(None), context(None, 1, 1, Some(1), false)));
     child.exited(false);
+}
+
+#[test]
+fn real_sdk_blocked_stdout_obeys_the_same_traversal_deadline() {
+    struct Owned(Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let executable = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/managed-pages");
+    let mut child = Owned(
+        Command::new(executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    fcntl_setfl(&input, fcntl_getfl(&input).unwrap() | OFlags::NONBLOCK).unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let mut bytes = Vec::new();
+            stdout
+                .by_ref()
+                .take((managed::MAX_FRAME_BYTES + 1) as u64)
+                .read_until(b'\n', &mut bytes)
+                .unwrap();
+            assert!(bytes.len() <= managed::MAX_FRAME_BYTES);
+            frames.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+        }
+        sender.send((stdout, frames)).unwrap();
+    });
+    input
+        .write_all(format!("{}\n", hello()).as_bytes())
+        .unwrap();
+    let started = Instant::now();
+    input
+        .write_all(
+            format!(
+                "{}\n",
+                status(7, scope(None), context(None, 1, 1, Some(1), false))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let (stdout, frames) = receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+    reader.join().unwrap();
+    assert_eq!(frames[0], hello());
+    assert_eq!(frames[1]["type"], "enumerate");
+
+    // this adversarial stdin peer tests output pressure, not host credit policy.
+    // read actual owned-pipe capacity; never shrink it or tune the host.
+    let capacity = rustix::pipe::fcntl_getpipe_size(stdout.get_ref()).unwrap();
+    assert!(
+        capacity <= managed::MAX_RETAINED_ENCODED_BYTES * 2,
+        "owned pipe exceeds the explicit stress-fixture budget"
+    );
+    let path = "/".to_string() + &"🙂".repeat(1023);
+    let responses = capacity / path.len() + 2;
+    let mut requests = Vec::new();
+    for index in 0..responses {
+        let pane = (100 + index).to_string();
+        let target = json!({"slot":"pane_footer","target":{"kind":"pane","reference":pane}});
+        let data = json!({"session":"paging-session","terminals":[{"pane":pane,"workspace":"10","cwd":path}],"next_cursor":null});
+        requests
+            .extend_from_slice(format!("{}\n", status(8 + index as u64, target, data)).as_bytes());
+    }
+    assert!(requests.len() < managed::MAX_RETAINED_ENCODED_BYTES * 4);
+    let writer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut bytes = requests.as_slice();
+        while !bytes.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "backpressure fixture stdin deadline"
+            );
+            match input.write(bytes) {
+                Ok(0) => break,
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => panic!("backpressure fixture stdin: {error}"),
+            }
+        }
+        input
+    });
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "full stdout must not defeat traversal deadline"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let input = writer.join().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(3500));
+    assert!(started.elapsed() < Duration::from_millis(5500));
+    let mut diagnostics = Vec::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .take(129)
+        .read_to_end(&mut diagnostics)
+        .unwrap();
+    assert!(diagnostics.len() <= 128);
+    assert!(String::from_utf8(diagnostics).unwrap().contains("TimedOut"));
+    let mut retained = Vec::new();
+    stdout
+        .take(capacity as u64 + 1)
+        .read_to_end(&mut retained)
+        .unwrap();
+    assert!(retained.len() <= capacity);
+    assert!(
+        retained.len() >= capacity / 2,
+        "stdout pressure must be non-vacuous"
+    );
+    for frame in retained
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|frame| frame.last() == Some(&b'\n'))
+    {
+        assert_ne!(
+            serde_json::from_slice::<Value>(frame).unwrap()["request_id"],
+            7
+        );
+    }
+    drop(input);
+    println!("sdk_traversal_backpressure elapsed_ms={} pipe_capacity={} retained_bytes={} no_empty_completion=true", started.elapsed().as_millis(), capacity, retained.len());
 }
