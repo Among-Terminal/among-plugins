@@ -45,7 +45,7 @@ jobs:
       - name: Clippy
         run: cargo +1.98.1 clippy --locked --all-targets -- -D warnings
       - name: Build the managed transport process fixture
-        run: cargo +1.98.1 build --locked --example managed-status
+        run: cargo +1.98.1 build --locked --example managed-status --example managed-pages
       - name: Original unit and process tests
         run: cargo +1.98.1 test --locked --all-targets
       - name: Standalone production binary build

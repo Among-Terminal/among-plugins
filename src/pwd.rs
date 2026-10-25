@@ -1,15 +1,34 @@
+use crate::managed::{Scope, Target};
 use crate::protocol::{scope_id, terminals, Status};
 use serde_json::{json, Value};
 
+pub fn managed_status(scope: &Scope, context: &Value) -> Status {
+    let Target::Pane { reference } = scope.target else {
+        return render_path(None);
+    };
+    if scope.slot != "pane_footer" {
+        return render_path(None);
+    }
+    let expected = reference.get().to_string();
+    let path = terminals(context)
+        .find(|terminal| terminal["pane"].as_str() == Some(expected.as_str()))
+        .and_then(|terminal| terminal["cwd"].as_str());
+    render_path(path)
+}
+
 pub fn status(scope: &str, context: &Value) -> Status {
-    let mut result = Status::empty(Some(1000));
     let Some(pane) = scope_id(scope, "pane_footer:") else {
-        return result;
+        return render_path(None);
     };
-    let Some(terminal) = terminals(context).find(|t| t["pane"].as_u64() == Some(pane)) else {
-        return result;
-    };
-    let Some(path) = terminal["cwd"].as_str().filter(|s| !s.is_empty()) else {
+    let path = terminals(context)
+        .find(|terminal| terminal["pane"].as_u64() == Some(pane))
+        .and_then(|terminal| terminal["cwd"].as_str());
+    render_path(path)
+}
+
+fn render_path(path: Option<&str>) -> Status {
+    let mut result = Status::empty(Some(1000));
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
         return result;
     };
     let text = path.chars().take(480).collect::<String>();

@@ -29,7 +29,8 @@ repeated hello refuses; no frame can rebind a running process to another session
 context. old session/generation and duplicate or decreasing IDs are ignored
 before invoking the consumer; current requests retain their exact ID and accepted
 binding in stdout. the host's IDs increase per process and never wrap. the client
-is synchronous: no delayed worker or queued result can outlive its binding.
+dispatch is synchronous; page reducers retain only bounded per-request state under
+the admitted binding, never delayed workers or saved context for another request.
 the host must still reject late replies or closed targets; client validation is
 not a substitute for host admission, live resolution or deadlines.
 
@@ -49,10 +50,13 @@ cwd is absent without its grant; an authorized unavailable cwd remains null, not
 a fabricated path. paths exceeding 4096 UTF-8 or 8192 encoded bytes refuse rather
 than truncate. sibling data and undeclared terminal fields refuse before callback.
 
-the callback sees the initial context page and returns a real `protocol::Status`.
-enumerate/context_page continuation is not implemented in this first slice; the
-pane-pwd port must add and test it before claiming paged enumeration support.
-likewise no configure/configured or events capability is advertised here.
+the existing `serve`/`run` callback sees the initial context page and returns a
+real `protocol::Status`. `run_paged` uses the same engine with a `PageConsumer`:
+`Complete` replies or `Continue` retains a bounded copy-only reducer state and
+requests the exact returned cursor/scope. status IDs and enumeration IDs are
+independent. other statuses continue dispatching while one page is outstanding.
+see [paging, local deadlines and retained-state bounds](managed-paging.md).
+no configure/configured or events capability is advertised here.
 
 `shutdown` stops with no further output (including before admission); EOF at a
 frame boundary exits successfully. partial EOF, malformed/unknown requests or
@@ -82,3 +86,5 @@ and refused admission, stale binding/ID suppression, canonical scoped data,
 framing and shutdown/EOF. these client-boundary tests are not real PluginHost
 admission, graphical output, a managed production port, artifact validation,
 timezone parity or migration acceptance. those gates remain separate and open.
+`examples/managed-pages.rs` is a second labelled protocol fixture for shared-engine
+count/byte continuation and failure tests, not another catalogue entry.

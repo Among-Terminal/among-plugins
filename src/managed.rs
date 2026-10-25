@@ -2,15 +2,24 @@
 //! merely extracting their sources must not silently change their identity.
 
 use crate::protocol::Status;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
+mod paging;
+mod stdio;
 mod wire;
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_CONTEXT_PAGE_BYTES: usize = 28 * 1024;
+pub const MAX_PENDING_STATUS: usize = 15;
+pub const MAX_RETAINED_ENCODED_BYTES: usize = MAX_PENDING_STATUS * MAX_FRAME_BYTES;
+pub const TRAVERSAL_BUDGET: Duration = Duration::from_secs(4);
 const STATUS_FEATURES: &[&str] = &["status", "context.terminals", "context.cwd"];
 
 #[derive(Debug)]
@@ -20,14 +29,14 @@ pub struct Profile<'a> {
     pub optional: &'a [&'a str],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
     pub slot: String,
     pub target: Target,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
     Application,
@@ -41,6 +50,42 @@ pub struct Reference(u64);
 impl Reference {
     pub fn get(self) -> u64 {
         self.0
+    }
+}
+
+impl Serialize for Reference {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+pub enum PageResult<S> {
+    Complete(Status),
+    Continue(S),
+}
+
+/// copy-only, static reducers cannot retain an input page through owned strings
+/// or vectors. physical and encoded state are bounded before queue admission.
+pub trait PageConsumer {
+    type State: Copy + Serialize + 'static;
+    fn status(&mut self, scope: &Scope, context: &Value) -> io::Result<PageResult<Self::State>>;
+    fn page(
+        &mut self,
+        scope: &Scope,
+        state: Self::State,
+        context: &Value,
+    ) -> io::Result<PageResult<Self::State>>;
+}
+
+struct Immediate<F>(F);
+
+impl<F: FnMut(&Scope, &Value) -> Status> PageConsumer for Immediate<F> {
+    type State = ();
+    fn status(&mut self, scope: &Scope, context: &Value) -> io::Result<PageResult<()>> {
+        Ok(PageResult::Complete(self.0(scope, context)))
+    }
+    fn page(&mut self, _: &Scope, _: (), _: &Value) -> io::Result<PageResult<()>> {
+        Err(wire::invalid())
     }
 }
 
@@ -83,6 +128,13 @@ enum Request {
         features: Vec<String>,
     },
     Status {
+        session: String,
+        generation: String,
+        request_id: u64,
+        scope: Scope,
+        context: Value,
+    },
+    ContextPage {
         session: String,
         generation: String,
         request_id: u64,
@@ -174,9 +226,7 @@ fn context_valid(context: &Value, scope: &Scope, admission: &Admission) -> bool 
     let Some(terminals) = context.get("terminals").and_then(Value::as_array) else {
         return false;
     };
-    if terminals.len() > 32
-        || serde_json::to_vec(terminals).map_or(true, |bytes| bytes.len() > 28 * 1024)
-    {
+    if terminals.len() > 32 || wire::measure(terminals, MAX_CONTEXT_PAGE_BYTES).is_err() {
         return false;
     }
     for field in ["next_cursor", "active_workspace", "focused_pane"] {
@@ -225,10 +275,9 @@ fn context_valid(context: &Value, scope: &Scope, admission: &Admission) -> bool 
                 return false;
             }
             if !cwd.is_null()
-                && !cwd.as_str().is_some_and(|text| {
-                    text.len() <= 4096
-                        && serde_json::to_vec(cwd).is_ok_and(|bytes| bytes.len() <= 8192)
-                })
+                && !cwd
+                    .as_str()
+                    .is_some_and(|text| text.len() <= 4096 && wire::measure(cwd, 8192).is_ok())
             {
                 return false;
             }
@@ -247,15 +296,33 @@ fn context_valid(context: &Value, scope: &Scope, admission: &Admission) -> bool 
 /// than copying identity/session authority from the latest arbitrary message.
 pub fn serve(
     profile: &Profile<'_>,
+    input: impl BufRead,
+    output: impl Write,
+    status: impl FnMut(&Scope, &Value) -> Status,
+) -> io::Result<()> {
+    serve_engine(
+        profile,
+        input,
+        output,
+        Immediate(status),
+        Rc::new(Cell::new(None)),
+    )
+}
+
+fn serve_engine(
+    profile: &Profile<'_>,
     mut input: impl BufRead,
     mut output: impl Write,
-    mut status: impl FnMut(&Scope, &Value) -> Status,
+    mut consumer: impl PageConsumer,
+    deadline: stdio::Deadline,
 ) -> io::Result<()> {
     if !profile.valid() {
         return Err(wire::invalid());
     }
     let mut admission: Option<Admission> = None;
+    let mut paging = paging::Paging::new(deadline.clone())?;
     while let Some(bytes) = wire::read_frame(&mut input)? {
+        stdio::check(&deadline)?;
         let value = wire::parse(&bytes)?;
         let request: Request = serde_json::from_value(value).map_err(|_| wire::invalid())?;
         match request {
@@ -313,23 +380,73 @@ pub fn serve(
                 {
                     return Err(wire::invalid());
                 }
+                paging.admit(&scope)?;
+                let started = Instant::now();
                 admission.last_request = Some(request_id);
-                let result = status(&scope, &context);
-                wire::write_frame(
+                match consumer.status(&scope, &context)? {
+                    PageResult::Complete(result) => {
+                        paging::reply(&mut output, admission, request_id, result)?
+                    }
+                    PageResult::Continue(state) => {
+                        paging.begin(admission, request_id, scope, &context, state, started)?;
+                        paging.enumerate(&mut output, admission)?;
+                    }
+                }
+            }
+            Request::ContextPage {
+                session,
+                generation,
+                request_id,
+                scope,
+                context,
+            } => {
+                let Some(admission) = admission.as_ref() else {
+                    return Err(wire::invalid());
+                };
+                if session != admission.session
+                    || generation != admission.generation
+                    || !scope.valid(&admission.features)
+                    || !context_valid(&context, &scope, admission)
+                {
+                    return Err(wire::invalid());
+                }
+                paging.page(
                     &mut output,
-                    &json!({"type":"status","session":admission.session,
-                    "generation":admission.generation,"request_id":request_id,
-                    "refresh_ms":result.refresh_ms,"fragments":result.fragments}),
+                    admission,
+                    request_id,
+                    &scope,
+                    &context,
+                    &mut consumer,
                 )?;
             }
         }
     }
-    Ok(())
+    if paging.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "managed traversal interrupted",
+        ))
+    }
 }
 
 pub fn run(profile: &Profile<'_>, status: impl FnMut(&Scope, &Value) -> Status) -> ExitCode {
-    match serve(profile, io::stdin().lock(), io::stdout().lock(), status) {
+    run_paged(profile, Immediate(status))
+}
+
+pub fn run_paged(profile: &Profile<'_>, consumer: impl PageConsumer) -> ExitCode {
+    let deadline = Rc::new(Cell::new(None));
+    let result = (|| {
+        let input = stdio::Input::new(deadline.clone())?;
+        let output = stdio::Output::new(deadline.clone())?;
+        serve_engine(profile, input, output, consumer, deadline)
+    })();
+    match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+        Err(error) => {
+            stdio::diagnose(error.kind());
+            ExitCode::FAILURE
+        }
     }
 }
