@@ -50,3 +50,29 @@ jobs:
         run: cargo +1.98.1 test --locked --all-targets
       - name: Standalone production binary build
         run: cargo +1.98.1 build --release --locked --bins
+      - name: Record actual managed resource measurements
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/managed-system-measurements-$EXPECTED_KERNEL"
+          mkdir -m 700 "$root"
+          git rev-parse HEAD > "$root/source.txt"
+          binary="$PWD/target/debug/system-status-managed"
+          test -f "$binary" && test -x "$binary" && test ! -L "$binary"
+          sha256sum "$binary" > "$root/binary-sha256.txt"
+          # The unchanged full suite above remains mandatory. This additional
+          # exact invocation retains successful numeric observations, not a
+          # retry or a serial substitute for any failed original test.
+          cargo +1.98.1 test --locked --test managed_system \
+            managed_system_measures_real_cpu_memory_and_root_disk \
+            -- --exact --nocapture --color=never 2>&1 | tee "$root/measurements.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$root/measurements.log"
+          test "$(grep -Fc 'actual_managed_resources ' "$root/measurements.log")" -eq 1
+          sha256sum -c "$root/binary-sha256.txt"
+      - name: Retain source-bound managed measurement evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: managed-system-measurements-${{ matrix.kernel }}
+          path: ${{ runner.temp }}/managed-system-measurements-${{ matrix.kernel }}/
+          if-no-files-found: warn
+          retention-days: 5

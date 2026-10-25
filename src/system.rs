@@ -1,3 +1,4 @@
+use crate::managed::{Scope, Target};
 use crate::protocol::Status;
 use serde_json::json;
 use std::time::Duration;
@@ -107,6 +108,15 @@ impl<S: Source> Sampler<S> {
             last_disk: None,
             values: [None; 3],
         }
+    }
+
+    // admission stays in the managed transport; both explicit entrypoints use
+    // the same sampler, counters and rate limits rather than a second renderer.
+    pub fn managed_status(&mut self, scope: &Scope, now: Duration) -> Status {
+        if scope.target != Target::Application {
+            return Status::empty(Some(1000));
+        }
+        self.status(&scope.slot, now)
     }
 
     pub fn status(&mut self, scope: &str, now: Duration) -> Status {

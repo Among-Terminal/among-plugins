@@ -27,5 +27,9 @@ name = "system-status"
 path = "src/bin/system-status.rs"
 
 [[bin]]
+name = "system-status-managed"
+path = "src/bin/system-status-managed.rs"
+
+[[bin]]
 name = "pane-pwd"
 path = "src/bin/pane-pwd.rs"
