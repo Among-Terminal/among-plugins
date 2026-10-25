@@ -48,5 +48,5 @@ jobs:
         run: cargo +1.98.1 build --locked --example managed-status
       - name: Original unit and process tests
         run: cargo +1.98.1 test --locked --all-targets
-      - name: Standalone legacy binary build
+      - name: Standalone production binary build
         run: cargo +1.98.1 build --release --locked --bins
