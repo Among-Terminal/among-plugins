@@ -76,8 +76,8 @@ jobs:
           mkdir dist/empty-cargo-home
           export CARGO_HOME="$PWD/dist/empty-cargo-home"
           cd dist/source-check/source
-          cargo +1.98.1 check --offline --locked
-          cargo +1.98.1 check --manifest-path tools/among-tools/Cargo.toml --offline --locked
+          cargo +1.98.1 build --release --bins --offline --locked
+          cargo +1.98.1 build --manifest-path tools/among-tools/Cargo.toml --offline --locked
       - name: Retain exact native plugin packages and inspection results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
