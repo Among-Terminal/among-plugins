@@ -3,10 +3,10 @@
 `system-status-managed` is the production managed API 1.2 entrypoint for identity
 `github:1431055733/system-status`. it requires only `status`, selects no optional
 features and uses the shared [managed transport](managed-status.md). legacy hello
-and pre-admission status are not fallback admission paths. the original
-`system-status` entrypoint and its original regression tests retain legacy 1.0.
+and pre-admission status are not fallback admission paths. there is no separate
+legacy executable or protocol loop.
 
-both entrypoints keep one `Sampler<Linux>` and one monotonic start time for their
+the managed entrypoint keeps one `Sampler<Linux>` and one monotonic start time for its
 whole process lifetime. the typed application-target adapter calls the same
 `Sampler::status`; it does not reconstruct the sampler, copy the calculations or
 turn a deterministic test source into the production measurement path.
@@ -53,7 +53,7 @@ bounded, child-locally configured `/usr/bin/df -P /` observes disk near its init
 sample, not after the five-second cache has legitimately retained an older value.
 comparison tolerances are 2/2/1 percentage points for CPU/MEM/DISK; meter/text
 agreement and bounds are checked independently of those tolerances.
-the unchanged full suite stays mandatory. native CI adds one exact successful-
+the full current suite stays mandatory. native CI adds one exact successful-
 output capture afterwards, recording source, executable digest and numeric/skew
 observations. this is not a retry-until-green or a substitute for the full suite;
 the extra invocation is not counted as another distinct integration test.
@@ -71,4 +71,4 @@ managed installation/review/enablement, update/disable/uninstall, terminal
 continuity or whole task 2.3 acceptance. those require exact-source host consumers
 and their real applicable boundary checks. no manifest/catalogue/artifact or
 plugin release is supplied here; future task 2.5 must explicitly select
-`system-status-managed`, without guessing the legacy executable from the id.
+`system-status-managed`, without guessing an executable from the plugin id.

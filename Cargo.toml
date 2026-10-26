@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"
 publish = false
+autobins = false
 
 [workspace]
 
@@ -18,24 +19,12 @@ rustix = { version = "1", features = ["fs", "event"] }
 rustix = { version = "1", features = ["pipe"] }
 
 [[bin]]
-name = "clock"
-path = "src/bin/clock.rs"
-
-[[bin]]
 name = "clock-managed"
 path = "src/bin/clock-managed.rs"
 
 [[bin]]
-name = "system-status"
-path = "src/bin/system-status.rs"
-
-[[bin]]
 name = "system-status-managed"
 path = "src/bin/system-status-managed.rs"
-
-[[bin]]
-name = "pane-pwd"
-path = "src/bin/pane-pwd.rs"
 
 [[bin]]
 name = "pane-pwd-managed"

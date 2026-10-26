@@ -1,5 +1,4 @@
-//! plugin-side API 1.2 admission. legacy processes keep their separate protocol;
-//! merely extracting their sources must not silently change their identity.
+//! Plugin-side API 1.2 admission and bounded, identity-scoped stdio dispatch.
 
 use crate::protocol::Status;
 use serde::{Deserialize, Serialize, Serializer};

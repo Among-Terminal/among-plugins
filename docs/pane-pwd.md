@@ -20,10 +20,9 @@ process. missing target data, absent/null/empty cwd and null with
 the host's responsibility; client validation is not evidence that a target is
 still live when its reply reaches Among.
 
-legacy `pane-pwd` remains on protocol 1.0 with numeric pane lookup. both entrypoints
-share the known-path renderer: first 480 Unicode characters in the visible text,
-the entire accepted path in the tooltip, priority 10 and 1000-ms refresh. neither
-entrypoint sniffs or falls back to the other's protocol.
+the renderer shows the first 480 Unicode characters in the visible text, the
+entire accepted path in the tooltip, priority 10 and 1000-ms refresh. there is
+no numeric-index legacy adapter or alternate legacy executable.
 
 ## bounds and SDK paging
 
@@ -43,4 +42,4 @@ see the [shared transport contract](managed-status.md).
 
 `tests/managed_pwd.rs` exercises the actual entrypoint's stdio. these are client
 boundary tests, not installed PluginHost/GTK lifecycle, hidden live-pane, closed
-target, package, legacy-retention or complete paging acceptance.
+target, package or complete paging acceptance.

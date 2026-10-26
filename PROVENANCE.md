@@ -31,9 +31,11 @@ is kept separately because its application-wide attribution paths are not the
 standalone plugin distribution's completed inventory. no compiled dependencies
 or user-facing binary package is distributed by this source-only import.
 
-the host still retains its original implementations and payloads until a reviewed,
-observed upgrade-retention gate permits cutover. this temporary staging copy is
-not a second supported production distribution or an automatic migration.
+at extraction, the host retained its original implementations and payloads as
+temporary staging. that history is not a promise to support old executables or
+an upgrade-retention gate: the managed ecosystem starts with Among 0.2.x.
+the original source manifest and Git history remain preserved even when obsolete
+legacy code and tests are removed from the current tree.
 
 ## later managed transport work
 

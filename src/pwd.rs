@@ -1,5 +1,5 @@
 use crate::managed::{Scope, Target};
-use crate::protocol::{scope_id, terminals, Status};
+use crate::protocol::{terminals, Status};
 use serde_json::{json, Value};
 
 pub fn managed_status(scope: &Scope, context: &Value) -> Status {
@@ -12,16 +12,6 @@ pub fn managed_status(scope: &Scope, context: &Value) -> Status {
     let expected = reference.get().to_string();
     let path = terminals(context)
         .find(|terminal| terminal["pane"].as_str() == Some(expected.as_str()))
-        .and_then(|terminal| terminal["cwd"].as_str());
-    render_path(path)
-}
-
-pub fn status(scope: &str, context: &Value) -> Status {
-    let Some(pane) = scope_id(scope, "pane_footer:") else {
-        return render_path(None);
-    };
-    let path = terminals(context)
-        .find(|terminal| terminal["pane"].as_u64() == Some(pane))
         .and_then(|terminal| terminal["cwd"].as_str());
     render_path(path)
 }
