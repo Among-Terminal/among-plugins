@@ -75,4 +75,4 @@ output, interleaving, correlation, shutdown/EOF, missing/partial/late pages,
 absolute deadline and resource refusal. production pane targeting remains a
 separate real entrypoint with only terminal/cwd/status grants. direct protocol
 tests do not establish authenticated installation, real PluginHost/GTK lifecycle,
-native arm64 or package/legacy-retention acceptance.
+native arm64 or installed-package acceptance.
