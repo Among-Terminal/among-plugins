@@ -32,9 +32,9 @@ pub fn relative(path: &str) -> bool {
                 && part != "."
                 && part != ".."
                 && !part.starts_with(".among-")
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+')
+                })
         })
 }
 
@@ -174,6 +174,9 @@ mod tests {
             assert!(!relative(path));
         }
         assert!(relative("bin/clock-managed"));
+        assert!(relative(
+            "THIRD_PARTY/RUST/rust-src/library/vendor/wasip2-1.0.3+wasi-0.2.9/LICENSE-MIT"
+        ));
     }
 
     #[test]

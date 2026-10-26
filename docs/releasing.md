@@ -56,6 +56,8 @@ compiler hash, installed component manifests and runtime rlib digests. Packaging
 refuses absent/changed licence files, missing std/core/alloc/compiler-builtins
 inputs or mismatched compiler/native host. Native inspection rereads those inputs
 and compares its receipt; inspection of another architecture never executes it.
+Empty, whitespace-only or non-UTF-8 attribution/component texts refuse both
+collection and package verification, including a self-consistent empty hash.
 
 `THIRD_PARTY/RUST` retains the actual standard-library copyright report, Rust
 MIT/Apache texts, rust-src licence files, compiler-builtins/libm/libunwind terms

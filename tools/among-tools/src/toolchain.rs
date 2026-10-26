@@ -126,7 +126,7 @@ fn source_notices(
         if kind.is_dir() {
             source_notices(&entry.path(), &path, collector, entries, depth + 1)?;
         } else if kind.is_file() && notice_name(&name) {
-            collector.file(format!("{PREFIX}rust-src/{path}"), &entry.path())?;
+            collector.text_file(format!("{PREFIX}rust-src/{path}"), &entry.path())?;
         } else if !kind.is_file() {
             return Err("linked or special Rust source-notice input".into());
         }
@@ -151,7 +151,7 @@ pub fn collect(architecture: &str) -> Result<Inputs> {
         return Err("Rust sysroot is not absolute".into());
     }
     let mut common = Collector::new(512, 16 * 1024 * 1024);
-    common.file(
+    common.text_file(
         format!("{PREFIX}COPYRIGHT-library.html"),
         &sysroot.join("share/doc/rust/COPYRIGHT-library.html"),
     )?;
@@ -177,7 +177,7 @@ pub fn collect(architecture: &str) -> Result<Inputs> {
         if matching.len() != 1 {
             return Err("Rust documentation licence text missing or ambiguous".into());
         }
-        common.file(format!("{PREFIX}{output}"), &matching[0])?;
+        common.text_file(format!("{PREFIX}{output}"), &matching[0])?;
     }
     let rust_source = sysroot.join("lib/rustlib/src/rust");
     source_notices(
@@ -196,7 +196,7 @@ pub fn collect(architecture: &str) -> Result<Inputs> {
     ] {
         let target = format!("{PREFIX}rust-src/{path}");
         if !common.files.contains_key(&target) {
-            common.file(target, &rust_source.join(path))?;
+            common.text_file(target, &rust_source.join(path))?;
         }
     }
     let common_record = json!({"release":RELEASE,"commit":commit,"source":"https://github.com/rust-lang/rust","source_path":"library","licence_scope":"standard-library report plus conservatively retained rust-src licence texts, compiler-builtins/libm and libunwind; not a per-function link proof; no compiler or OS binary is redistributed"});
@@ -216,7 +216,7 @@ pub fn collect(architecture: &str) -> Result<Inputs> {
             "channel-manifest.toml",
         ),
     ] {
-        native.file(
+        native.text_file(
             format!("{PREFIX}native/{target}"),
             &sysroot.join("lib/rustlib").join(source),
         )?;
@@ -251,6 +251,9 @@ pub fn collect(architecture: &str) -> Result<Inputs> {
                 return Err("Rust runtime library count exceeded".into());
             }
             let bytes = archive::read(&entry.path(), archive::MAX_FILE)?;
+            if bytes.is_empty() {
+                return Err("empty Rust runtime library input".into());
+            }
             libraries.push(member(format!("lib/rustlib/{host}/lib/{name}"), &bytes));
         }
     }
@@ -330,6 +333,11 @@ pub fn verify(
         let bytes = files
             .get(&declared.path)
             .ok_or("required Rust notice missing from package")?;
+        if declared.size == 0
+            || std::str::from_utf8(bytes).map_or(true, |text| text.trim().is_empty())
+        {
+            return Err("empty or non-UTF-8 required Rust notice/component input".into());
+        }
         if bytes.len() as u64 != declared.size || archive::hash(bytes) != declared.sha256 {
             return Err("Rust notice digest mismatch".into());
         }
@@ -474,6 +482,32 @@ mod tests {
         let mut changed = record.clone();
         changed.runtime_libraries.pop();
         assert!(verify(&changed, "amd64", &files).is_err());
+        for name in [
+            "COPYRIGHT-library.html",
+            "LICENSE-MIT",
+            "rust-src/library/compiler-builtins/LICENSE.txt",
+            "rust-src/library/Cargo.lock",
+        ] {
+            let path = format!("{PREFIX}{name}");
+            let mut empty_files = files.clone();
+            empty_files.insert(path.clone(), Vec::new());
+            let mut empty_record = record.clone();
+            let declaration = empty_record
+                .common_notices
+                .iter_mut()
+                .find(|member| member.path == path)
+                .unwrap();
+            declaration.size = 0;
+            declaration.sha256 = archive::hash(&[]);
+            empty_files.insert(
+                format!("{PREFIX}native/BUILD.json"),
+                serde_json::to_vec(&empty_record).unwrap(),
+            );
+            assert!(verify(&empty_record, "amd64", &empty_files)
+                .unwrap_err()
+                .to_string()
+                .contains("empty or non-UTF-8"));
+        }
     }
 
     #[test]
