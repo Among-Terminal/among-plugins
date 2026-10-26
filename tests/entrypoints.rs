@@ -1,4 +1,5 @@
 use among_example_plugins::managed;
+use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -15,21 +16,77 @@ impl Drop for Process {
     }
 }
 
+fn collect_available(reader: &mut impl Read, bytes: &mut Vec<u8>, limit: usize) -> bool {
+    let mut buffer = [0; 4096];
+    match reader.read(&mut buffer) {
+        Ok(0) => true,
+        Ok(count) => {
+            assert!(bytes.len() + count <= limit, "Cargo metadata output limit");
+            bytes.extend_from_slice(&buffer[..count]);
+            false
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            false
+        }
+        Err(error) => panic!("Cargo metadata pipe failed: {error}"),
+    }
+}
+
 #[test]
 fn cargo_exposes_only_the_three_managed_production_entrypoints() {
-    let output = Command::new(env!("CARGO"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args([
-            "metadata",
-            "--offline",
-            "--locked",
-            "--no-deps",
-            "--format-version=1",
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{:?}", output);
-    let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO"))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args([
+                "metadata",
+                "--offline",
+                "--locked",
+                "--no-deps",
+                "--format-version=1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = process.0.stdout.take().unwrap();
+    let mut stderr = process.0.stderr.take().unwrap();
+    fcntl_setfl(&stdout, fcntl_getfl(&stdout).unwrap() | OFlags::NONBLOCK).unwrap();
+    fcntl_setfl(&stderr, fcntl_getfl(&stderr).unwrap() | OFlags::NONBLOCK).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let mut status = None;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    loop {
+        assert!(Instant::now() < deadline, "Cargo metadata deadline");
+        if !stdout_closed {
+            stdout_closed = collect_available(&mut stdout, &mut output, 1024 * 1024);
+        }
+        if !stderr_closed {
+            stderr_closed = collect_available(&mut stderr, &mut errors, 16 * 1024);
+        }
+        if status.is_none() {
+            status = process.0.try_wait().unwrap();
+        }
+        if status.is_some() && stdout_closed && stderr_closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        status.unwrap().success(),
+        "Cargo metadata failed: {}",
+        String::from_utf8_lossy(&errors)
+    );
+    let metadata: Value = serde_json::from_slice(&output).unwrap();
     let packages = metadata["packages"].as_array().unwrap();
     assert_eq!(packages.len(), 1);
     let mut binaries = packages[0]["targets"]
