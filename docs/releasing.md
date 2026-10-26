@@ -34,6 +34,8 @@ regular USTAR members only, fixed modes/owners/timestamps, a gzip trailer and
 complete member sizes/digests. No installer, hook, runtime build or auto-enable
 operation is packaged. Source delivery contains tracked project files plus the
 complete versioned Cargo vendor tree and offline source-replacement configuration.
+Source collection admits each file against running 32,768-file/256-MiB limits
+before reading/retaining it, and bounds directory traversal to 65,536 entries.
 Dependency text collection includes README/notice/copyright/license files; this
 is material for legal review, not a claim that metadata alone proves compliance.
 
@@ -56,6 +58,8 @@ CI retains native outputs under source-SHA-labelled artifacts and also builds
 the delivered source offline with an empty Cargo home. CI artifacts are temporary
 preparation inputs, not installable GitHub Release assets. Do not advertise an
 installation catalogue until real published asset identities are bound.
+Failed jobs also retain any partial package/inspection files; those artifacts are
+diagnostics, never accepted build inputs merely because they were uploaded.
 
 ## Separately authorized release and catalogue
 
@@ -82,6 +86,9 @@ installation catalogue until real published asset identities are bound.
    and requires the resulting commit to match both build records. Required assets
    must have unique names/IDs and matching actual GitHub size/SHA256/upload state.
    It repeats release and complete tag-chain inspection before writing output.
+   Recorded draft/prerelease state must remain unchanged; the receipt uses the
+   confirmed state. Output above the host's 1-MiB catalogue limit is refused before
+   creating the output directory.
    No release/asset IDs, missing platforms or empty success are invented. Observed
    consistency is not independent publisher authentication or protection from tag
    movement after inspection.

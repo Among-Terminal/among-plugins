@@ -2,6 +2,7 @@ mod archive;
 mod catalogue;
 mod package;
 mod process;
+mod source;
 
 use std::error::Error;
 use std::path::Path;

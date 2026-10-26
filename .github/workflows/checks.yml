@@ -79,12 +79,12 @@ jobs:
           cargo +1.98.1 check --offline --locked
           cargo +1.98.1 check --manifest-path tools/among-tools/Cargo.toml --offline --locked
       - name: Retain exact native plugin packages and inspection results
-        if: success()
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: official-plugin-packages-${{ matrix.architecture }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: dist/${{ matrix.architecture }}/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
       - name: Record actual managed resource measurements
         run: |

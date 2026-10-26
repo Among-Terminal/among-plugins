@@ -3,6 +3,7 @@ use crate::{
     package::{self, Build},
     process, Result,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,6 +12,33 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PUBLISHER: u64 = 339567100;
+const MAX_CATALOGUE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, PartialEq, Deserialize)]
+struct ReleaseState {
+    id: u64,
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+}
+
+fn confirmed_state(first: &Value, second: &Value) -> Result<ReleaseState> {
+    let first: ReleaseState = serde_json::from_value(first.clone())?;
+    let second: ReleaseState = serde_json::from_value(second.clone())?;
+    if first != second {
+        return Err("release identity/tag/publication state changed during inspection".into());
+    }
+    Ok(second)
+}
+
+fn encode_catalogue(value: &Value) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_CATALOGUE_BYTES {
+        return Err("catalogue exceeds the host 1-MiB byte limit".into());
+    }
+    Ok(bytes)
+}
 
 fn api(path: &str, maximum: usize, deadline: Instant) -> Result<Value> {
     if Instant::now() >= deadline {
@@ -83,7 +111,7 @@ fn binding(tag: &str, deadline: Instant) -> Result<Value> {
         match kind.as_str() {
             "commit" => {
                 let commit = api(
-                    &format!("repositories/{}/commits/{sha}", package::REPOSITORY),
+                    &format!("repositories/{}/git/commits/{sha}", package::REPOSITORY),
                     64 * 1024,
                     deadline,
                 )?;
@@ -258,11 +286,13 @@ pub fn generate(
     if catalogue != confirmed_catalogue || observed != confirmed_binding {
         return Err("release asset or complete tag chain changed during inspection".into());
     }
+    let state = confirmed_state(&release, &confirmed_release)?;
+    let bytes = encode_catalogue(&confirmed_catalogue)?;
     fs::create_dir(output)?;
-    archive::json(&output.join("among-plugins.json"), &catalogue)?;
+    archive::write_new(&output.join("among-plugins.json"), &bytes)?;
     archive::json(
         &output.join("release-binding.json"),
-        &json!({"repository_id":package::REPOSITORY,"publisher_id":PUBLISHER,"release_id":release_id,"draft":release["draft"],"prerelease":release["prerelease"],"binding":observed,"source_asset_id":asset(&release,&first.source_archive,source_size,&first.source_sha256)?}),
+        &json!({"repository_id":package::REPOSITORY,"publisher_id":PUBLISHER,"release_id":state.id,"draft":state.draft,"prerelease":state.prerelease,"binding":confirmed_binding,"source_asset_id":asset(&confirmed_release,&first.source_archive,source_size,&first.source_sha256)?}),
     )?;
     Ok(())
 }
@@ -270,6 +300,20 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_state_changes_and_oversized_catalogues_refuse_before_output() {
+        let original = json!({"id":123,"tag_name":"test-tag","draft":true,"prerelease":true});
+        assert!(confirmed_state(&original, &original).unwrap().draft);
+        let mut changed = original.clone();
+        changed["draft"] = false.into();
+        assert!(confirmed_state(&original, &changed).is_err());
+        changed = original.clone();
+        changed["prerelease"] = false.into();
+        assert!(confirmed_state(&original, &changed).is_err());
+        assert!(confirmed_state(&original, &json!({"id":123,"tag_name":"test-tag"})).is_err());
+        assert!(encode_catalogue(&json!({"schema_version":1,"plugins":[]})).is_ok());
+        assert!(encode_catalogue(&json!({"members":"x".repeat(MAX_CATALOGUE_BYTES)})).is_err());
+    }
     #[test]
     fn exact_assets_reject_missing_corrupt_and_ambiguous_membership() {
         let digest = "a".repeat(64);

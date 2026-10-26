@@ -1,6 +1,6 @@
 use crate::{
     archive::{self, Member},
-    process, Result,
+    process, source, Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -275,16 +275,7 @@ fn native(path: &Path, architecture: &str) -> Result<(Runtime, Vec<String>)> {
                 .split_once('[')
                 .and_then(|(_, tail)| tail.split_once(']').map(|(name, _)| name))
                 .ok_or("unrecognized DT_NEEDED")?;
-            if ![
-                "libc.so.6",
-                "libm.so.6",
-                "libgcc_s.so.1",
-                "libpthread.so.0",
-                "libdl.so.2",
-                "librt.so.1",
-            ]
-            .contains(&name)
-            {
+            if !system_library(name, architecture) {
                 return Err(format!("unmodeled shared library: {name}").into());
             }
             libraries.insert(name.to_owned());
@@ -307,32 +298,24 @@ fn native(path: &Path, architecture: &str) -> Result<(Runtime, Vec<String>)> {
     ))
 }
 
-fn walk(root: &Path, prefix: &str, files: &mut archive::Files, depth: usize) -> Result<()> {
-    if depth > 16 || files.len() > 32768 {
-        return Err("source tree bounds exceeded".into());
-    }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "non-UTF-8 source name")?;
-        let path = format!("{prefix}/{name}");
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            walk(&entry.path(), &path, files, depth + 1)?;
-        } else if kind.is_file() {
-            let bytes = archive::read(&entry.path(), archive::MAX_FILE)?;
-            files.insert(path, (bytes, false));
-        } else {
-            return Err("linked or special source file".into());
-        }
-    }
-    Ok(())
+fn system_library(name: &str, architecture: &str) -> bool {
+    [
+        "libc.so.6",
+        "libm.so.6",
+        "libgcc_s.so.1",
+        "libpthread.so.0",
+        "libdl.so.2",
+        "librt.so.1",
+    ]
+    .contains(&name)
+        || matches!(
+            (name, architecture),
+            ("ld-linux-x86-64.so.2", "amd64") | ("ld-linux-aarch64.so.1", "arm64")
+        )
 }
 
-fn delivery(root: &Path, vendor: &Path) -> Result<(archive::Files, archive::Files)> {
-    let mut source = BTreeMap::new();
+fn delivery(root: &Path, vendor: &Path) -> Result<(source::Collector, archive::Files)> {
+    let mut source = source::Collector::new(32768, 256 * 1024 * 1024);
     let tracked = process::capture(
         Command::new("git")
             .current_dir(root)
@@ -345,15 +328,12 @@ fn delivery(root: &Path, vendor: &Path) -> Result<(archive::Files, archive::File
         .filter(|path| !path.is_empty())
     {
         let path = std::str::from_utf8(path)?;
-        source.insert(
-            format!("source/{path}"),
-            (archive::read(&root.join(path), archive::MAX_FILE)?, false),
-        );
+        source.file(format!("source/{path}"), &root.join(path))?;
     }
     if !fs::symlink_metadata(vendor)?.is_dir() {
         return Err("vendor directory is not a regular directory".into());
     }
-    walk(vendor, "vendor", &mut source, 0)?;
+    source.walk(vendor, "vendor", 0)?;
     let mut legal = BTreeMap::new();
     for path in [
         "LICENSE",
@@ -411,7 +391,11 @@ fn delivery(root: &Path, vendor: &Path) -> Result<(archive::Files, archive::File
             dependencies.insert(directory.clone(), json!({"name":name,"version":version,"license":package["license"],"repository":package["repository"]}));
             let prefix = format!("vendor/{directory}/");
             let mut notices = 0;
-            for (path, content) in source.iter().filter(|(path, _)| path.starts_with(&prefix)) {
+            for (path, content) in source
+                .files
+                .iter()
+                .filter(|(path, _)| path.starts_with(&prefix))
+            {
                 let suffix = &path[prefix.len()..];
                 let legal_file = suffix.split('/').any(|component| {
                     let name = component.to_ascii_lowercase();
@@ -441,10 +425,7 @@ fn delivery(root: &Path, vendor: &Path) -> Result<(archive::Files, archive::File
     }
     let index = serde_json::to_vec_pretty(&dependencies)?;
     legal.insert("THIRD_PARTY/DEPENDENCIES.json".into(), (index, false));
-    source.insert("source/.cargo/config.toml".into(), (b"[source.crates-io]\nreplace-with = 'vendored-sources'\n[source.vendored-sources]\ndirectory = '../vendor'\n".to_vec(), false));
-    if source.values().map(|(bytes, _)| bytes.len()).sum::<usize>() > 256 * 1024 * 1024 {
-        return Err("source delivery exceeds 256 MiB".into());
-    }
+    source.insert("source/.cargo/config.toml".into(), b"[source.crates-io]\nreplace-with = 'vendored-sources'\n[source.vendored-sources]\ndirectory = '../vendor'\n".to_vec())?;
     Ok((source, legal))
 }
 
@@ -454,14 +435,11 @@ pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Resu
     let (mut source, legal) = delivery(root, vendor)?;
     source.insert(
         "SOURCE.json".into(),
-        (
-            serde_json::to_vec_pretty(&json!({"repository_id": REPOSITORY, "revision": revision}))?,
-            false,
-        ),
-    );
+        serde_json::to_vec_pretty(&json!({"repository_id": REPOSITORY, "revision": revision}))?,
+    )?;
     fs::create_dir(output)?;
     let source_archive = format!("among-plugins-{revision}-source.tar.gz");
-    archive::pack(&output.join(&source_archive), &source)?;
+    archive::pack(&output.join(&source_archive), &source.files)?;
     let source_sha256 = archive::hash(&archive::read(
         &output.join(&source_archive),
         archive::MAX_FILE,
@@ -606,20 +584,29 @@ pub fn check(root: &Path, directory: &Path) -> Result<()> {
         if runtime != package.artifact.runtime || libraries != package.needed_libraries {
             return Err("packaged ABI differs from build record".into());
         }
-        let identity = format!("github:{REPOSITORY}/{}", package.manifest.id);
-        let hello = json!({"type":"managed_hello","major":1,"minor":2,"identity":identity,"session":"package-check","generation":"package-check","features":package.manifest.required_features});
+        let hello = admission(&package.manifest);
         let input = format!("{hello}\n{{\"type\":\"shutdown\"}}\n");
         let output = process::capture(&mut Command::new(&binary), input.as_bytes(), 256 * 1024)?;
-        let response: Value = serde_json::from_slice(&output)?;
-        if response != hello {
-            return Err("packaged executable did not complete real managed admission".into());
-        }
         archive::write_new(
             &checks.join(format!("{}-admission.json", package.manifest.id)),
             &output,
         )?;
+        let response: Value = serde_json::from_slice(&output)?;
+        if response != hello {
+            return Err(format!(
+                "packaged {} admission mismatch: expected {hello}, observed {response}",
+                package.manifest.id
+            )
+            .into());
+        }
     }
     Ok(())
+}
+
+fn admission(manifest: &Manifest) -> Value {
+    let identity = format!("github:{REPOSITORY}/{}", manifest.id);
+    let features: BTreeSet<_> = manifest.required_features.iter().collect();
+    json!({"type":"managed_hello","major":1,"minor":2,"identity":identity,"session":"package-check","generation":"package-check","features":features})
 }
 
 #[cfg(test)]
@@ -630,5 +617,34 @@ mod tests {
         assert!(elf(b"not ELF", "amd64").is_err());
         assert!(elf(b"\x7fELF\x02\x01\x01", "arm64").is_err());
         assert!(elf(&[0; 128], "ppc64").is_err());
+    }
+
+    #[test]
+    fn only_the_matching_glibc_loader_is_a_modeled_dependency() {
+        assert!(system_library("ld-linux-x86-64.so.2", "amd64"));
+        assert!(system_library("ld-linux-aarch64.so.1", "arm64"));
+        assert!(!system_library("ld-linux-x86-64.so.2", "arm64"));
+        assert!(!system_library("libpublisher.so.1", "amd64"));
+    }
+
+    #[test]
+    fn pane_package_admission_matches_actual_sdk_canonical_feature_order() {
+        use among_example_plugins::{managed, pwd};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (manifest, _) = manifest(&root, "pane-pwd").unwrap();
+        let hello = admission(&manifest);
+        let input = format!("{hello}\n{{\"type\":\"shutdown\"}}\n");
+        let profile = managed::Profile {
+            identity: "github:1431055733/pane-pwd",
+            required: &["status", "context.terminals", "context.cwd"],
+            optional: &[],
+        };
+        let mut output = Vec::new();
+        managed::serve(&profile, input.as_bytes(), &mut output, pwd::managed_status).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), hello);
+        assert_eq!(
+            hello["features"],
+            json!(["context.cwd", "context.terminals", "status"])
+        );
     }
 }
