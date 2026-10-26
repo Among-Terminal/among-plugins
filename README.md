@@ -21,11 +21,16 @@ for admission, permissions and stdio framing.
 
 ## getting started
 
-**no official plugin release or binary download has been published yet.**
-the [releases page](https://github.com/Among-Terminal/among-plugins/releases)
-is the place to check for published packages. this checkout has no installable
-managed catalogue or supported standalone installer; building a binary does not
-install or enable it in Among.
+the [0.1.0-rc.1 integration prerelease](https://github.com/Among-Terminal/among-plugins/releases/tag/v0.1.0-rc.1)
+provides ready-built Linux amd64/arm64 packages, requiring glibc 2.34 or newer.
+the machine-readable [managed catalogue](among-plugins.json) binds the actual
+release assets and exact tagged source; it does not follow a moving latest URL.
+
+use Among's 0.2.x managed repository installation flow. this candidate is not a
+stable release; cross-repository installed lifecycle and application package
+acceptance are still in progress. installation, required-access review and
+enablement remain explicit. there is no standalone installer, and neither
+publication nor building a binary installs, grants access to or enables a plugin.
 
 for the application's current plugin setup and API, read
 [Among's plugin guide](https://github.com/Among-Terminal/among/blob/main/docs/plugins.md).
