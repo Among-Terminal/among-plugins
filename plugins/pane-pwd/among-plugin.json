@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "pane-pwd",
+  "version": "0.1.0-rc.1",
+  "name": "Pane working directory",
+  "description": "The directory reported by Among for each authorized pane, in its footer.",
+  "entrypoint": "bin/pane-pwd-managed",
+  "api": { "major": 1, "minor": 2 },
+  "required_features": ["status", "context.terminals", "context.cwd"],
+  "optional_features": []
+}

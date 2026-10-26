@@ -18,14 +18,19 @@ jobs:
           - runner: ubuntu-24.04
             kernel: x86_64
             rust_host: x86_64-unknown-linux-gnu
+            architecture: amd64
           - runner: ubuntu-24.04-arm
             kernel: aarch64
             rust_host: aarch64-unknown-linux-gnu
+            architecture: arm64
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_BUILD_JOBS: '1'
       EXPECTED_KERNEL: ${{ matrix.kernel }}
       EXPECTED_RUST_HOST: ${{ matrix.rust_host }}
+      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -50,6 +55,37 @@ jobs:
         run: cargo +1.98.1 test --locked --all-targets
       - name: Standalone production binary build
         run: cargo +1.98.1 build --release --locked --bins
+      - name: Packaging tools quality gate
+        run: |
+          cargo +1.98.1 fmt --manifest-path tools/among-tools/Cargo.toml --all --check
+          cargo +1.98.1 clippy --manifest-path tools/among-tools/Cargo.toml --locked --all-targets -- -D warnings
+          cargo +1.98.1 test --manifest-path tools/among-tools/Cargo.toml --locked --all-targets
+          cargo +1.98.1 build --manifest-path tools/among-tools/Cargo.toml --locked
+      - name: Build native packages and complete vendored source delivery
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > dist/vendor-config.toml
+          tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$PWD/dist/${{ matrix.architecture }}"
+          (cd "dist/${{ matrix.architecture }}" && sha256sum -c SHA256SUMS)
+      - name: Delivered source builds offline without the original checkout or registry
+        run: |
+          set -euo pipefail
+          mkdir dist/source-check
+          tar -xzf dist/${{ matrix.architecture }}/among-plugins-*-source.tar.gz -C dist/source-check
+          mkdir dist/empty-cargo-home
+          export CARGO_HOME="$PWD/dist/empty-cargo-home"
+          cd dist/source-check/source
+          cargo +1.98.1 check --offline --locked
+          cargo +1.98.1 check --manifest-path tools/among-tools/Cargo.toml --offline --locked
+      - name: Retain exact native plugin packages and inspection results
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: official-plugin-packages-${{ matrix.architecture }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/${{ matrix.architecture }}/
+          if-no-files-found: error
+          retention-days: 14
       - name: Record actual managed resource measurements
         run: |
           set -euo pipefail

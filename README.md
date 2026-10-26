@@ -9,9 +9,9 @@ built as standalone Rust processes without linking the application or GTK.
 
 | plugin | purpose | entrypoints | documentation |
 | --- | --- | --- | --- |
-| clock | local time in the application footer (`HH:MM:SS`) | `clock-managed` — managed API 1.2 | [contract and timezone limits](docs/clock.md) |
-| system-status | Linux CPU, memory and root-filesystem usage in the application header; unavailable measurements show `N/A` | `system-status-managed` — managed API 1.2 | [resource contract and namespace limits](docs/system-status.md) |
-| pane-pwd | working directory supplied by Among for each pane, displayed in its footer | `pane-pwd-managed` — managed API 1.2 scoped pane adapter | [target, required access and SDK paging](docs/pane-pwd.md) |
+| clock | local time in the application footer (`HH:MM:SS`) | `clock-managed` — managed API 1.2 | [contract and timezone limits](docs/clock.md), [manifest](plugins/clock/among-plugin.json) |
+| system-status | Linux CPU, memory and root-filesystem usage in the application header; unavailable measurements show `N/A` | `system-status-managed` — managed API 1.2 | [resource contract and namespace limits](docs/system-status.md), [manifest](plugins/system-status/among-plugin.json) |
+| pane-pwd | working directory supplied by Among for each pane, displayed in its footer | `pane-pwd-managed` — managed API 1.2 scoped pane adapter | [target, required access and SDK paging](docs/pane-pwd.md), [manifest](plugins/pane-pwd/among-plugin.json) |
 
 each plugin has one catalogue entry covering its purpose, available entrypoints
 and documentation. add new plugins here rather than maintaining separate lists.
@@ -56,6 +56,10 @@ extraction baseline, not a published standalone release. plugin release versions
 are independent of the Among application version.
 
 ## licence and provenance
+
+Native package/source preparation and the separately authorized publication
+procedure are described in [releasing](docs/releasing.md). CI artifacts are not
+published plugin releases and do not supply installation or execution consent.
 
 original project code is [Apache-2.0](LICENSE). see [NOTICE](NOTICE) for attribution
 and dependency redistribution boundaries. [PROVENANCE.md](PROVENANCE.md) records
