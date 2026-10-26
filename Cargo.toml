@@ -1,3 +1,5 @@
+# modified after extraction from Among Terminal: managed-only entrypoints and SDK dependencies.
+# original input and subsequent changes are recorded in PROVENANCE.md.
 [package]
 name = "among-example-plugins"
 version = "0.1.2"

@@ -1,3 +1,6 @@
+//! modified after extraction from Among Terminal: a typed managed-target adapter
+//! was added around the retained sampler. see PROVENANCE.md for original provenance.
+
 use crate::managed::{Scope, Target};
 use crate::protocol::Status;
 use serde_json::json;

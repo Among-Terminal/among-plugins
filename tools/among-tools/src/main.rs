@@ -3,6 +3,7 @@ mod catalogue;
 mod package;
 mod process;
 mod source;
+mod toolchain;
 
 use std::error::Error;
 use std::path::Path;

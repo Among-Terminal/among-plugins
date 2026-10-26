@@ -40,7 +40,7 @@ jobs:
         run: |
           test "$(uname -m)" = "$EXPECTED_KERNEL"
       - name: Install the pinned Rust tools
-        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --component rust-docs --component rust-src
       - name: Bind the actual compiler host
         run: |
           rustc +1.98.1 --version --verbose

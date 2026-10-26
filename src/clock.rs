@@ -1,3 +1,6 @@
+//! modified after extraction from Among Terminal: typed managed-only target admission.
+//! provenance and retained upstream attribution are recorded in PROVENANCE.md.
+
 use crate::managed::{Scope, Target};
 use crate::protocol::Status;
 use serde_json::{json, Value};

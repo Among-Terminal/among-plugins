@@ -385,7 +385,7 @@ mod tests {
                 assets.push(json!({"name":name,"size":42,"digest":format!("sha256:{digest}"),"id":(2+platform*3+index) as u64,"state":"uploaded"}));
                 packages.push(json!({"name":name,"manifest":{"schema_version":1,"id":id,"version":"test","name":id,"description":"fixture","entrypoint":format!("bin/{id}-managed"),"api":{"major":1,"minor":2},"required_features":["status"],"optional_features":[]},"manifest_sha256":digest,"artifact":{"os":"linux","architecture":architecture,"runtime":{"kind":"native","libc":"glibc","minimum":"2.34"},"dependencies":[],"format":"tar.gz","size":42,"sha256":digest,"members":[]},"needed_libraries":[]}));
             }
-            builds.push(serde_json::from_value::<Build>(json!({"schema_version":1,"repository_id":package::REPOSITORY,"revision":revision,"architecture":architecture,"source_archive":"source.tar.gz","source_sha256":digest,"packages":packages})).unwrap());
+            builds.push(serde_json::from_value::<Build>(json!({"schema_version":2,"repository_id":package::REPOSITORY,"revision":revision,"architecture":architecture,"source_archive":"source.tar.gz","source_sha256":digest,"packages":packages,"toolchain":{"release":"1.98.1","commit":revision,"host":"synthetic metadata control","compiler_sha256":digest,"components":[],"runtime_libraries":[],"common_notices":[]}})).unwrap());
         }
         let mut release = json!({"id":123,"tag_name":"test-tag","assets":assets});
         let observed = json!({"tag":"test-tag","commit":revision});

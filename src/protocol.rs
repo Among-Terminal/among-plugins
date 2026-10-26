@@ -1,3 +1,7 @@
+//! modified after extraction from Among Terminal: shared status data only;
+//! the permissive legacy runner and numeric scope adapter were removed.
+//! see PROVENANCE.md for the unchanged historical extraction input.
+
 use serde::Serialize;
 use serde_json::Value;
 

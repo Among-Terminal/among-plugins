@@ -47,3 +47,33 @@ the wire contract follows that commit's managed runtime and plugin guide. this
 adaptation is not part of the unchanged initial 19-file extraction manifest;
 the original licence and notice remain applicable. it adds no host-source build
 dependency or authority to publish a managed release.
+
+## prominent modification notices
+
+The original hashes above are historical and are deliberately unchanged. The
+retained derived files now carry file-local notices, independently of Git history:
+
+| file | changes since the extraction input |
+| --- | --- |
+| `Cargo.toml` | managed entrypoints/SDK dependencies; legacy bins and installer removed |
+| `src/lib.rs` | managed SDK exports replace the standalone installer |
+| `src/clock.rs` | typed managed target; legacy renderer entry removed |
+| `src/pwd.rs` | scoped string-reference lookup; numeric legacy adapter removed |
+| `src/protocol.rs` | shared status data retained; permissive legacy loop removed |
+| `src/system.rs` | managed target adapter around the existing sampler |
+| `src/managed/wire.rs` | standalone bounded adaptation of the named host validators |
+
+Removed legacy source/examples/tests are withdrawals, not unchanged files or
+passing old behavior. `Cargo.lock`, `tests/system.rs`, the project licence and
+original upstream notice remain byte-preserved where the historical hashes apply.
+
+## linked Rust runtime attribution
+
+Native package production collects the actual pinned builder's Rust1.98.1
+standard-library copyright report, licence texts, relevant rust-src notices and
+compiler-builtins/libm/libunwind terms. Per-platform receipts retain compiler,
+component manifest and runtime rlib digests; the shared source delivery retains
+the common runtime notices and exact Rust source commit. These inputs are separate
+from the application's Cargo lock graph. See `docs/releasing.md` for the boundary:
+this is not compiler redistribution, independent toolchain authentication or a
+claim to know every linked function's provenance.

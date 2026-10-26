@@ -26,7 +26,7 @@ impl Collector {
             || self.files.contains_key(path)
             || self.files.len() >= self.maximum_files
         {
-            return Err("source path, duplicate or file-count limit".into());
+            return Err(format!("source path, duplicate or file-count limit: {path}").into());
         }
         self.maximum_bytes
             .checked_sub(self.bytes)
@@ -52,6 +52,19 @@ impl Collector {
         // beyond remaining credit before retaining any new file in the map.
         let bytes = archive::read(source, remaining)?;
         self.insert(path, bytes)
+    }
+
+    pub fn text_file(&mut self, path: String, source: &Path) -> Result<()> {
+        self.file(path.clone(), source)?;
+        let bytes = &self
+            .files
+            .get(&path)
+            .ok_or("text input was not collected")?
+            .0;
+        if std::str::from_utf8(bytes).map_or(true, |text| text.trim().is_empty()) {
+            return Err(format!("empty or non-UTF-8 required text input: {path}").into());
+        }
+        Ok(())
     }
 
     pub fn walk(&mut self, root: &Path, prefix: &str, depth: usize) -> Result<()> {
@@ -86,6 +99,28 @@ impl Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn required_text_collection_rejects_empty_or_whitespace_files() {
+        let directory =
+            std::env::temp_dir().join(format!("among-required-text-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("LICENSE");
+        for bytes in [b"".as_slice(), b" \n\t".as_slice(), &[0xff]] {
+            fs::write(&path, bytes).unwrap();
+            let mut collector = Collector::new(4, 1024);
+            assert!(collector
+                .text_file("LICENSE".into(), &path)
+                .unwrap_err()
+                .to_string()
+                .contains("empty or non-UTF-8"));
+        }
+        fs::write(&path, b"licence text").unwrap();
+        assert!(Collector::new(4, 1024)
+            .text_file("LICENSE".into(), &path)
+            .is_ok());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn running_byte_and_flat_directory_limits_apply_before_retention() {
         let directory =

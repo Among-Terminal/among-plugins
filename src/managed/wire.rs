@@ -1,3 +1,7 @@
+//! adapted and modified from Apache-2.0 Among Terminal data/transport validation
+//! at 5d0d00e6cc5aa0529969b9d0bdbc2cc00b15361c for the standalone bounded SDK.
+//! original source paths, licence and retained notices are recorded in PROVENANCE.md.
+
 use super::MAX_FRAME_BYTES;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};

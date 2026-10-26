@@ -1,6 +1,6 @@
 use crate::{
     archive::{self, Member},
-    process, source, Result,
+    process, source, toolchain, Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -77,6 +77,7 @@ pub struct Build {
     pub source_archive: String,
     pub source_sha256: String,
     pub packages: Vec<Package>,
+    pub toolchain: toolchain::Record,
 }
 
 pub fn hex(value: &str, length: usize) -> bool {
@@ -433,6 +434,10 @@ pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Resu
     let revision = revision(root)?;
     let architecture = architecture()?.to_owned();
     let (mut source, legal) = delivery(root, vendor)?;
+    let rust = toolchain::collect(&architecture)?;
+    for (path, (bytes, _)) in &rust.common {
+        source.insert(format!("toolchain/{path}"), bytes.clone())?;
+    }
     source.insert(
         "SOURCE.json".into(),
         serde_json::to_vec_pretty(&json!({"repository_id": REPOSITORY, "revision": revision}))?,
@@ -450,6 +455,8 @@ pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Resu
         let binary = binaries.join(format!("{id}-managed"));
         let (runtime, needed_libraries) = native(&binary, &architecture)?;
         let mut files = legal.clone();
+        files.extend(rust.common.clone());
+        files.extend(rust.native.clone());
         files.insert("among-plugin.json".into(), (manifest_bytes.clone(), false));
         files.insert(
             manifest.entrypoint.clone(),
@@ -478,13 +485,14 @@ pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Resu
         });
     }
     let report = Build {
-        schema_version: 1,
+        schema_version: 2,
         repository_id: REPOSITORY,
         revision,
         architecture,
         source_archive,
         source_sha256,
         packages,
+        toolchain: rust.record,
     };
     archive::json(&output.join("build.json"), &report)?;
     let mut sums = String::new();
@@ -502,7 +510,7 @@ pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Resu
 pub fn load(root: &Path, directory: &Path) -> Result<Build> {
     let report: Build =
         serde_json::from_slice(&archive::read(&directory.join("build.json"), 1024 * 1024)?)?;
-    if report.schema_version != 1
+    if report.schema_version != 2
         || report.repository_id != REPOSITORY
         || report.revision != revision(root)?
         || !["amd64", "arm64"].contains(&report.architecture.as_str())
@@ -549,6 +557,7 @@ pub fn load(root: &Path, directory: &Path) -> Result<Build> {
             return Err("package archive size/digest mismatch".into());
         }
         let files = archive::unpack(&packed, &package.artifact.members)?;
+        toolchain::verify(&report.toolchain, &report.architecture, &files)?;
         if files.get("among-plugin.json") != Some(&bytes) {
             return Err("packaged manifest mismatch".into());
         }
@@ -566,6 +575,9 @@ pub fn check(root: &Path, directory: &Path) -> Result<()> {
     let report = load(root, directory)?;
     if report.architecture != architecture()? {
         return Err("package smoke test requires its native architecture".into());
+    }
+    if toolchain::collect(&report.architecture)?.record != report.toolchain {
+        return Err("native Rust compiler/component inputs changed after packaging".into());
     }
     let checks = directory.join(format!("checks-{}", std::process::id()));
     fs::create_dir(&checks)?;
