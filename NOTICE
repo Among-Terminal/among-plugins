@@ -5,7 +5,10 @@ the original sources were extracted from Among Terminal. their unchanged
 upstream notice is retained in provenance/among-NOTICE; its distribution paths
 describe the upstream application, not this standalone source snapshot.
 
-Cargo.lock records independently licensed dependencies. their source is not
-vendored here. future binary redistribution requires applicable dependency
-notices and source delivery; this file is not a completed binary-package audit
-and does not relicense third-party components.
+Cargo.lock records independently licensed dependencies. prepared binary packages
+include their texts/metadata in THIRD_PARTY and separately retain linked Rust
+runtime attribution in THIRD_PARTY/RUST. complete vendored project source and
+common Rust runtime notices are delivered in the matching source archive.
+per-platform Rust component/compiler provenance is retained with each binary
+package; it is not inferred from Cargo.lock. none of these inputs relicenses
+third-party components or claims an independent legal opinion.

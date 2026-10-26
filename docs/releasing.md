@@ -8,11 +8,13 @@ human-readable catalogue; this guide intentionally does not maintain another lis
 
 ## Native preparation
 
-Use Rust 1.98.1, binutils (`readelf`), glibc `ldd`, Git and Cargo on the actual
+Use Rust 1.98.1 with its matching `rust-docs`/`rust-src` components, binutils
+(`readelf`), glibc `ldd`, Git and Cargo on the actual
 amd64/arm64 architecture. No host checkout, GTK, emulator or cross-built binary is
 used. Run quality gates in a clean container or the native CI runners:
 
 ```sh
+rustup component add --toolchain 1.98.1 rust-docs rust-src
 cargo +1.98.1 fmt --all --check
 cargo +1.98.1 clippy --locked --all-targets -- -D warnings
 cargo +1.98.1 build --locked --example managed-status --example managed-pages
@@ -39,7 +41,7 @@ before reading/retaining it, and bounds directory traversal to 65,536 entries.
 Dependency text collection includes README/notice/copyright/license files; this
 is material for legal review, not a claim that metadata alone proves compliance.
 
-`build.json` records the exact source, platform, archive digest/member inventory,
+`build.json` producer schema2 records the exact source, platform, archive digest/member inventory,
 GLIBC symbol-version floor measured by `readelf`, and actual DT_NEEDED libraries.
 Unmodeled libraries, RPATH/RUNPATH, wrong ELF machine/interpreter, absent symbol
 floors and missing native libraries refuse packaging. The baseline compiler
@@ -47,6 +49,24 @@ target is used, not `target-cpu=native`. This checks ABI/runtime consistency, no
 every CPU extension, minimum kernel, distribution certification or reproducibility.
 glibc, libgcc and timezone data are supplied by the target system. No external
 command grants or notification authority are declared by these status plugins.
+
+The installer catalogue and plugin manifests remain schema1. Producer schema2
+additionally requires the actual native builder's Rust release/commit/host,
+compiler hash, installed component manifests and runtime rlib digests. Packaging
+refuses absent/changed licence files, missing std/core/alloc/compiler-builtins
+inputs or mismatched compiler/native host. Native inspection rereads those inputs
+and compares its receipt; inspection of another architecture never executes it.
+
+`THIRD_PARTY/RUST` retains the actual standard-library copyright report, Rust
+MIT/Apache texts, rust-src licence files, compiler-builtins/libm/libunwind terms
+and source commit. The Fuchsia mutex source notice is retained conservatively
+even though Linux GNU does not select that target. The runtime report and source
+notices are separate from the application Cargo graph and are not replaced by
+unicode-ident's notices. Common notices enter the shared source archive too;
+machine-specific component/compiler receipts remain in each native package.
+The two source archives must still agree. This is a conservative attribution
+superset, not a per-function linker proof, compiler redistribution, independent
+toolchain authentication or a claim to redistribute target OS libraries.
 
 Package inspection reopens the archives, checks complete members/hashes/modes and
 manifest agreement, then runs each extracted executable through real managed

@@ -1,3 +1,6 @@
+//! modified after extraction from Among Terminal: scoped managed pane references,
+//! without the old numeric adapter. original attribution is retained in PROVENANCE.md.
+
 use crate::managed::{Scope, Target};
 use crate::protocol::{terminals, Status};
 use serde_json::{json, Value};
