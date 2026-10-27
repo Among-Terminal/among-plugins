@@ -294,8 +294,11 @@ jobs:
 
   # The release workflow as an author's repository calls it, in check mode:
   # this repository's own plugins are built, packaged and catalogued on both
-  # architectures by the tools of this commit; nothing is published.
+  # architectures by the tools of this commit; nothing is published. The
+  # workflow builds its tools only from Among-Terminal/among-plugins, so in a
+  # fork this job would always fail and is skipped there instead.
   release-workflow-check:
+    if: github.repository == 'Among-Terminal/among-plugins'
     uses: ./.github/workflows/plugin-release.yml
     with:
       publish: false

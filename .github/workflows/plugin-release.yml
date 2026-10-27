@@ -29,7 +29,8 @@ name: Plugin release
 # checks the permissions of every job of a called workflow when the run
 # starts, skipped ones included, so a publish job that asked for
 # `contents: write` itself would make a read-only caller in check mode fail
-# before anything runs. The caller grants exactly `contents: write`.
+# before anything runs. The caller must grant exactly `contents: write`:
+# nothing here can lower a broader token the caller passes to publish.
 
 on:
   workflow_call:
@@ -279,15 +280,20 @@ jobs:
         with:
           name: plugin-build-arm64
           path: build/arm64
-      - name: Catalogue and release asset set, without publishing
+      - name: Catalogue, release asset set and draft binding, without publishing
         env:
           REPOSITORY_ID: ${{ github.repository_id }}
           PIN: ${{ needs.pin.outputs.commit }}
+          TAG: ${{ needs.pin.outputs.tag }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" check "$PIN" release
+          tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
+          tools/among-tools release-binding release/inventory.json "$WORKFLOW_REF" "$RUN_ID" binding
           (cd release/assets && sha256sum -c SHA256SUMS)
           ls -l release/assets
+          cat binding
 
   publish:
     if: ${{ inputs.publish }}
