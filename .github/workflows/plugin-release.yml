@@ -20,9 +20,17 @@ name: Plugin release
 # schema 2 catalogue among-plugins.json and SHA256SUMS. Only the publish job
 # can write, and it runs no code of the author's repository. The caller sets
 # the per-tag concurrency group: a group here could deadlock with the caller's.
+#
+# With `publish: false` (for example on pull requests) it builds, packages and
+# catalogues the event commit, needs only `contents: read` and writes nothing.
 
 on:
   workflow_call:
+    inputs:
+      publish:
+        description: Publish a release for the tag. false builds, packages and catalogues the event commit and writes nothing.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -42,13 +50,20 @@ jobs:
           REF: ${{ github.ref }}
           SHA: ${{ github.sha }}
           REPOSITORY_ID: ${{ github.repository_id }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
+          printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
+          if [ "$PUBLISH" != true ]; then
+            # A check run builds the event commit and publishes nothing.
+            echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+            echo "tag=check" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           case "$REF" in
             refs/tags/v*) tag="${REF#refs/tags/}" ;;
             *) echo "plugin releases run on a v* tag, not $REF" >&2; exit 1 ;;
           esac
-          printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
           printf '%s' "$tag" | grep -Eqx '[A-Za-z0-9._-]{1,128}'
           # Peel annotated tags through the API of the numeric repository.
           kind=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.type)
@@ -219,7 +234,45 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
+  check:
+    if: ${{ !inputs.publish }}
+    needs: [pin, tools-amd64, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs['tools-amd64'].outputs.artifact }}
+          path: tools
+          merge-multiple: true
+      - name: Accept only the tool built by the tools job
+        env:
+          EXPECTED: ${{ needs['tools-amd64'].outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          test -f tools/among-tools && test ! -L tools/among-tools
+          test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
+          chmod 755 tools/among-tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plugin-build-amd64
+          path: build/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plugin-build-arm64
+          path: build/arm64
+      - name: Catalogue and release asset set, without publishing
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          PIN: ${{ needs.pin.outputs.commit }}
+        run: |
+          set -euo pipefail
+          tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" check "$PIN" release
+          (cd release/assets && sha256sum -c SHA256SUMS)
+          ls -l release/assets
+
   publish:
+    if: ${{ inputs.publish }}
     needs: [pin, tools-amd64, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30

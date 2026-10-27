@@ -50,6 +50,22 @@ settings must allow public reusable workflows. Tags are `v` followed by
 letters, digits, `.`, `_` or `-` (at most 128 characters); a tag such as
 `v1.0.0+build` is refused.
 
+## Checking pull requests
+
+The same workflow with `publish: false` builds, packages and catalogues the
+event commit on both architectures and publishes nothing; it needs only
+`contents: read`:
+
+```yaml
+on:
+  pull_request:
+jobs:
+  check:
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@<commit SHA>
+    with:
+      publish: false
+```
+
 ## What a release contains
 
 - `<id>-<version>-linux-amd64.tar.gz` and `…-arm64.tar.gz` for each plugin,

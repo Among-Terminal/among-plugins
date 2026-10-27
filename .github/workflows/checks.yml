@@ -291,3 +291,11 @@ jobs:
           printf 'x' >> "resized/$(jq -r '.packages[0].name' arm64/build.json)"
           refuse 'differs from its record' \
             "$tool" author-catalogue amd64 resized 7 v1.0.0 "$revision" resized-out
+
+  # The release workflow as an author's repository calls it, in check mode:
+  # this repository's own plugins are built, packaged and catalogued on both
+  # architectures by the tools of this commit; nothing is published.
+  release-workflow-check:
+    uses: ./.github/workflows/plugin-release.yml
+    with:
+      publish: false
