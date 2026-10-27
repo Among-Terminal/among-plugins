@@ -227,6 +227,10 @@ jobs:
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --component rust-docs --component rust-src
           cargo +1.98.1 fmt --all --check
           cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+          # cargo test builds examples only as test harnesses under deps/;
+          # tests that run an example as a process find it in
+          # target/debug/examples only after an ordinary build.
+          cargo +1.98.1 build --locked --all-targets
           cargo +1.98.1 test --locked --all-targets
           cargo +1.98.1 build --release --locked --bins
       - name: Package with the verified tool
