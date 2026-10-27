@@ -5,6 +5,9 @@ name: Plugin release
 #   on:
 #     push:
 #       tags: ['v*']
+#   concurrency:
+#     group: plugin-release-${{ github.ref }}
+#     cancel-in-progress: false
 #   jobs:
 #     release:
 #       permissions:
@@ -15,17 +18,14 @@ name: Plugin release
 # among-tools from this repository at exactly the called commit, and publishes
 # an immutable GitHub release with both packages, the source delivery, the
 # schema 2 catalogue among-plugins.json and SHA256SUMS. Only the publish job
-# can write, and it runs no code of the author's repository.
+# can write, and it runs no code of the author's repository. The caller sets
+# the per-tag concurrency group: a group here could deadlock with the caller's.
 
 on:
   workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: plugin-release-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   pin:
@@ -106,7 +106,7 @@ jobs:
           name: among-tools-amd64
           path: tools/among-tools
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 5
 
   tools-arm64:
     runs-on: ubuntu-24.04-arm
@@ -147,7 +147,7 @@ jobs:
           name: among-tools-arm64
           path: tools/among-tools
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 5
 
   build:
     needs: [pin, tools-amd64, tools-arm64]
@@ -265,6 +265,15 @@ jobs:
           "$tool" release-binding release/inventory.json "$WORKFLOW_REF" "$RUN_ID" binding
           resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
           test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
+          # Checks a published release against the whole expected snapshot.
+          verify_published() {
+            resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
+            test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
+            gh api "repositories/$REPOSITORY_ID/releases/$1" > release.json
+            gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
+            "$tool" verify-release published release.json release/inventory.json binding latest.json
+            echo "published $(jq -r .html_url release.json) for $TAG at $PIN"
+          }
           # Drafts are only visible in the list; at most one may carry this tag.
           gh api --paginate "repositories/$REPOSITORY_ID/releases?per_page=100" \
             | jq -s --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' > existing.json
@@ -272,11 +281,18 @@ jobs:
           if [ "$count" -gt 1 ]; then echo "more than one release for $TAG" >&2; exit 1; fi
           if [ "$count" -eq 1 ]; then
             jq '.[0]' existing.json > release.json
-            "$tool" verify-release resume release.json release/inventory.json binding > missing.txt
             id=$(jq -r .id release.json)
+            if [ "$(jq -r .draft release.json)" = false ]; then
+              # An earlier attempt of this run published and stopped before
+              # its final check; the binding check refuses any other release.
+              verify_published "$id"
+              exit 0
+            fi
+            "$tool" verify-release resume release.json release/inventory.json binding > missing.txt
           else
+            # Drafts cannot be latest; publishing below makes it latest.
             gh api -X POST "repositories/$REPOSITORY_ID/releases" \
-              -f tag_name="$TAG" -F draft=true -F prerelease=false -F make_latest=true \
+              -f tag_name="$TAG" -F draft=true -F prerelease=false \
               -f name="$TAG" -F body=@binding > release.json
             id=$(jq -r .id release.json)
             (cd release/assets && ls) > missing.txt
@@ -288,9 +304,4 @@ jobs:
           gh api "repositories/$REPOSITORY_ID/releases/$id" > release.json
           "$tool" verify-release draft release.json release/inventory.json binding
           gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F draft=false > /dev/null
-          resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
-          test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
-          gh api "repositories/$REPOSITORY_ID/releases/$id" > release.json
-          gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
-          "$tool" verify-release published release.json release/inventory.json binding latest.json
-          echo "published $(jq -r .html_url release.json) for $TAG at $PIN"
+          verify_published "$id"

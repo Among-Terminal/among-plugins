@@ -31,6 +31,9 @@ published.
 on:
   push:
     tags: ['v*']
+concurrency:
+  group: plugin-release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   release:
     permissions:
@@ -39,13 +42,19 @@ jobs:
 ```
 
 Reference a full commit SHA. The workflow builds `among-tools` from exactly
-that commit (`job.workflow_sha`), pins the tagged commit before any of your
-code runs, and only its final job can write to the repository.
+that commit (`job.workflow_sha`) and pins the tagged commit before any of your
+code runs. Your build job checks the tool's SHA-256 before using it; the final
+job, the only one that can write to the repository, downloads the tool again
+by artifact ID and digest and runs none of your code. The repository's Actions
+settings must allow public reusable workflows. Tags are `v` followed by
+letters, digits, `.`, `_` or `-` (at most 128 characters); a tag such as
+`v1.0.0+build` is refused.
 
 ## What a release contains
 
 - `<id>-<version>-linux-amd64.tar.gz` and `…-arm64.tar.gz` for each plugin,
-  with the manifest, the executable, the icon if any, `LICENSE`, `NOTICE`,
+  with the manifest, the executable, the icon if any, `LICENSE`, `NOTICE` if
+  present,
   `THIRD_PARTY/**` from the vendored crates, the Rust toolchain notices and
   `SOURCE.json`;
 - `source-<commit>.tar.gz`, the source and licence delivery;
@@ -71,3 +80,15 @@ manifest bytes or archives differ from the expected values. A draft created by
 the workflow carries one `among-release-binding:` line in its body; a later
 run resumes only a draft of the same run with that binding and never replaces
 assets, moves tags or deletes releases.
+
+## When a run stops
+
+- A re-run of the same workflow run resumes its own draft and uploads only
+  the assets still missing, or finishes the checks of a release it already
+  published.
+- A draft left with an asset that is not fully uploaded, or a draft of
+  another run, is never changed: delete that draft by hand and run the
+  workflow again.
+- A release published while immutable releases were off fails the workflow
+  with its URL and is left in place. Among refuses it; enable immutable
+  releases and publish a new version.

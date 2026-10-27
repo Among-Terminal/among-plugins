@@ -333,11 +333,16 @@ struct Checked {
     manifests: BTreeMap<String, Vec<u8>>,
 }
 
+/// Checks a build's Rust toolchain notices; production uses
+/// `toolchain::verify`, tests a stand-in for a synthetic toolchain record.
+type ToolchainCheck = fn(&toolchain::Record, &str, &BTreeMap<String, Vec<u8>>) -> Result<()>;
+
 fn load(
     directory: &Path,
     repository_id: u64,
     revision: &str,
     architecture: &str,
+    verify_toolchain: ToolchainCheck,
 ) -> Result<Checked> {
     let build: Build = serde_json::from_value(strict::parse(&archive::read(
         &directory.join("build.json"),
@@ -384,12 +389,27 @@ fn load(
             return Err(format!("{architecture} package {} profile mismatch", package.id).into());
         }
         package::version(&artifact.runtime.minimum)?;
+        // The name is checked before it is used as a path; its version part
+        // is compared with the manifest below.
+        if package.name.contains('/')
+            || !archive::relative(&package.name)
+            || !package.name.starts_with(&format!("{}-", package.id))
+            || !package
+                .name
+                .ends_with(&format!("-linux-{architecture}.tar.gz"))
+        {
+            return Err(format!(
+                "{architecture} package name {} is not a package of {}",
+                package.name, package.id
+            )
+            .into());
+        }
         let bytes = archive::read(&directory.join(&package.name), archive::MAX_FILE)?;
         if bytes.len() as u64 != artifact.size || archive::hash(&bytes) != artifact.sha256 {
             return Err(format!("{} differs from its record", package.name).into());
         }
         let files = archive::unpack(&bytes, &artifact.members)?;
-        toolchain::verify(&build.toolchain, architecture, &files)?;
+        verify_toolchain(&build.toolchain, architecture, &files)?;
         let manifest = files
             .get("among-plugin.json")
             .ok_or_else(|| format!("{} has no manifest", package.name))?;
@@ -454,12 +474,32 @@ pub fn catalogue(
     revision: &str,
     output: &Path,
 ) -> Result<()> {
+    catalogue_with(
+        amd64,
+        arm64,
+        repository_id,
+        tag,
+        revision,
+        output,
+        toolchain::verify,
+    )
+}
+
+fn catalogue_with(
+    amd64: &Path,
+    arm64: &Path,
+    repository_id: u64,
+    tag: &str,
+    revision: &str,
+    output: &Path,
+    verify_toolchain: ToolchainCheck,
+) -> Result<()> {
     if repository_id == 0 || !package::hex(revision, 40) || !crate::catalogue::tag_name(tag) {
         return Err("expected repository ID, revision and tag are malformed".into());
     }
     let builds = [
-        load(amd64, repository_id, revision, "amd64")?,
-        load(arm64, repository_id, revision, "arm64")?,
+        load(amd64, repository_id, revision, "amd64", verify_toolchain)?,
+        load(arm64, repository_id, revision, "arm64", verify_toolchain)?,
     ];
     if builds[0].build.source_sha256 != builds[1].build.source_sha256
         || builds[0].manifests != builds[1].manifests
@@ -812,7 +852,7 @@ mod tests {
     #[test]
     fn plugin_layouts_that_pack_unexpected_files_are_refused() {
         type Layout = fn(&Path);
-        let cases: [(&str, Layout, &str); 7] = [
+        let cases: [(&str, Layout, &str); 11] = [
             (
                 "extra file",
                 |root| {
@@ -888,6 +928,57 @@ mod tests {
                 },
                 "duplicate JSON key: id",
             ),
+            (
+                "schema version 2",
+                |root| {
+                    let manifest =
+                        String::from_utf8(host_example("a", "bin/a", "theme:x")).unwrap();
+                    write(
+                        &root.join("plugins/a/among-plugin.json"),
+                        manifest
+                            .replace("\"schema_version\": 1", "\"schema_version\": 2")
+                            .as_bytes(),
+                    );
+                },
+                "manifest needs schema_version 1",
+            ),
+            (
+                "api major 2",
+                |root| {
+                    let manifest =
+                        String::from_utf8(host_example("a", "bin/a", "theme:x")).unwrap();
+                    write(
+                        &root.join("plugins/a/among-plugin.json"),
+                        manifest.replace("\"major\": 1", "\"major\": 2").as_bytes(),
+                    );
+                },
+                "manifest needs schema_version 1",
+            ),
+            (
+                "version with a space",
+                |root| {
+                    let manifest =
+                        String::from_utf8(host_example("a", "bin/a", "theme:x")).unwrap();
+                    write(
+                        &root.join("plugins/a/among-plugin.json"),
+                        manifest.replace("\"1.0.0\"", "\"1.0 beta\"").as_bytes(),
+                    );
+                },
+                "manifest needs schema_version 1",
+            ),
+            (
+                "33 plugins",
+                |root| {
+                    for index in 0..33 {
+                        let id = format!("p{index}");
+                        write(
+                            &root.join(format!("plugins/{id}/among-plugin.json")),
+                            &host_example(&id, &format!("bin/{id}"), "theme:x"),
+                        );
+                    }
+                },
+                "must hold 1 to 32 plugin directories",
+            ),
         ];
         for (name, layout, reason) in cases {
             let root = Scratch::new("layout");
@@ -954,6 +1045,21 @@ mod tests {
         path
     }
 
+    fn tagged(directory: &Path, body: &str, tag: &str, prerelease: bool, id: u64) -> PathBuf {
+        let path = directory.join(format!(
+            "tagged-{}.json",
+            fs::read_dir(directory).unwrap().count()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"id": id, "tag_name": tag, "draft": true,
+                "prerelease": prerelease, "body": body, "assets": []}))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
     fn asset(name: &str, size: u64, sha: &str) -> Value {
         json!({"name": name, "size": size, "state": "uploaded", "digest": format!("sha256:{sha}")})
     }
@@ -1012,6 +1118,76 @@ mod tests {
                 "two bindings",
                 release(&scratch.0, &format!("{line}{line}"), true, json!([]), false),
                 "more than one binding",
+            ),
+            (
+                "asset with another size",
+                release(
+                    &scratch.0,
+                    &line,
+                    true,
+                    json!([asset("a-1.0.0-linux-amd64.tar.gz", 11, &"d".repeat(64))]),
+                    false,
+                ),
+                "differs from the inventory",
+            ),
+            (
+                "asset still uploading",
+                release(
+                    &scratch.0,
+                    &line,
+                    true,
+                    json!([{"name": "a-1.0.0-linux-amd64.tar.gz", "size": 10, "state": "starter", "digest": format!("sha256:{}", "d".repeat(64))}]),
+                    false,
+                ),
+                "differs from the inventory",
+            ),
+            (
+                "asset without digest",
+                release(
+                    &scratch.0,
+                    &line,
+                    true,
+                    json!([{"name": "a-1.0.0-linux-amd64.tar.gz", "size": 10, "state": "uploaded", "digest": null}]),
+                    false,
+                ),
+                "differs from the inventory",
+            ),
+            (
+                "repeated asset name",
+                release(
+                    &scratch.0,
+                    &line,
+                    true,
+                    json!([package.clone(), package.clone()]),
+                    false,
+                ),
+                "differs from the inventory",
+            ),
+            (
+                "too many assets",
+                release(
+                    &scratch.0,
+                    &line,
+                    true,
+                    Value::Array(vec![package.clone(); 65]),
+                    false,
+                ),
+                "more than 64 assets",
+            ),
+            (
+                "release of another tag",
+                tagged(&scratch.0, &line, "v2.0.0", false, 41),
+                "is not the draft release of v1.0.0",
+            ),
+            (
+                "prerelease draft",
+                tagged(&scratch.0, &line, "v1.0.0", true, 41),
+                "is not the draft release of v1.0.0",
+            ),
+            (
+                "release without ID",
+                tagged(&scratch.0, &line, "v1.0.0", false, 0),
+                "release has no ID",
             ),
         ];
         for (name, path, reason) in cases {
@@ -1089,5 +1265,585 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("latest release is 40"));
+    }
+}
+
+/// Synthetic builds for `load` and `catalogue`: real archives, a minimal ELF
+/// executable that `package::elf` accepts and a stand-in toolchain record,
+/// since real Rust notices exist only on a native CI runner.
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("among-author-build-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Scratch(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// One loadable segment holding the entry point and the glibc loader as
+    /// interpreter: the smallest file `package::elf` accepts.
+    fn elf(architecture: &str) -> Vec<u8> {
+        let (machine, loader): (u16, &[u8]) = match architecture {
+            "amd64" => (62, b"/lib64/ld-linux-x86-64.so.2\0"),
+            _ => (183, b"/lib/ld-linux-aarch64.so.1\0"),
+        };
+        let mut bytes = vec![0u8; 64 + 2 * 56];
+        // ELF64, little endian, current version.
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        let mut put = |offset: usize, value: u64, length: usize| {
+            bytes[offset..offset + length].copy_from_slice(&value.to_le_bytes()[..length]);
+        };
+        put(16, 3, 2);
+        put(18, u64::from(machine), 2);
+        put(20, 1, 4);
+        put(24, 0x1000, 8);
+        put(32, 64, 8);
+        put(52, 64, 2);
+        put(54, 56, 2);
+        put(56, 2, 2);
+        put(64, 1, 4);
+        put(68, 5, 4);
+        put(80, 0x1000, 8);
+        put(96, 64, 8);
+        put(104, 0x100, 8);
+        put(120, 3, 4);
+        put(124, 4, 4);
+        put(128, 176, 8);
+        put(152, loader.len() as u64, 8);
+        bytes.extend_from_slice(loader);
+        bytes
+    }
+
+    fn manifest(id: &str, description: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"schema_version":1,"id":id,"version":"1.0.0",
+            "name":id,"description":description,"entrypoint":format!("bin/{id}"),
+            "api":{"major":1,"minor":2},"required_features":["status"],"optional_features":[]}))
+        .unwrap()
+    }
+
+    fn toolchain_record() -> toolchain::Record {
+        serde_json::from_value(json!({"release":"1.98.1","commit":REVISION,"host":"synthetic",
+            "compiler_sha256":"a".repeat(64),"components":[],"runtime_libraries":[],"common_notices":[]}))
+        .unwrap()
+    }
+
+    fn accept(_: &toolchain::Record, _: &str, _: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Writes a build directory for `architecture` with the given plugins
+    /// (id, manifest bytes) and the same source archive bytes on every call.
+    fn build(root: &Path, architecture: &str, plugins: &[(&str, Vec<u8>)]) -> PathBuf {
+        build_from(root, architecture, plugins, b"text")
+    }
+
+    fn build_from(
+        root: &Path,
+        architecture: &str,
+        plugins: &[(&str, Vec<u8>)],
+        source_text: &[u8],
+    ) -> PathBuf {
+        let directory = root.join(architecture);
+        fs::create_dir(&directory).unwrap();
+        let source_archive = source_archive_name(REVISION);
+        let source =
+            archive::Files::from([("source/README".to_owned(), (source_text.to_vec(), false))]);
+        archive::pack(&directory.join(&source_archive), &source).unwrap();
+        let source_sha256 = archive::hash(&fs::read(directory.join(&source_archive)).unwrap());
+        let record = source_record(7, REVISION, &source_archive, &source_sha256);
+        let mut packages = Vec::new();
+        for (id, manifest) in plugins {
+            let files = archive::Files::from([
+                ("among-plugin.json".to_owned(), (manifest.clone(), false)),
+                (format!("bin/{id}"), (elf(architecture), true)),
+                (
+                    "SOURCE.json".to_owned(),
+                    (serde_json::to_vec_pretty(&record).unwrap(), false),
+                ),
+            ]);
+            let name = package_name(id, "1.0.0", architecture);
+            let members = archive::pack(&directory.join(&name), &files).unwrap();
+            let bytes = fs::read(directory.join(&name)).unwrap();
+            packages.push(Package {
+                id: (*id).to_owned(),
+                name,
+                manifest_sha256: archive::hash(manifest),
+                artifact: Artifact {
+                    os: "linux".into(),
+                    architecture: architecture.into(),
+                    runtime: Runtime {
+                        kind: "native".into(),
+                        libc: "glibc".into(),
+                        minimum: "2.34".into(),
+                    },
+                    dependencies: Vec::new(),
+                    format: "tar.gz".into(),
+                    size: bytes.len() as u64,
+                    sha256: archive::hash(&bytes),
+                    members,
+                },
+                needed_libraries: vec!["libc.so.6".into()],
+            });
+        }
+        archive::json(
+            &directory.join("build.json"),
+            &Build {
+                schema: BUILD_SCHEMA.into(),
+                schema_version: 1,
+                repository_id: 7,
+                revision: REVISION.into(),
+                architecture: architecture.into(),
+                source_archive,
+                source_sha256,
+                packages,
+                toolchain: toolchain_record(),
+            },
+        )
+        .unwrap();
+        directory
+    }
+
+    fn edit_build(directory: &Path, edit: impl Fn(&mut Value)) {
+        let path = directory.join("build.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut value);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    fn plugins() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("alpha", manifest("alpha", "first")),
+            ("beta", manifest("beta", "second")),
+        ]
+    }
+
+    #[test]
+    fn both_architectures_make_a_schema_2_catalogue() {
+        let root = Scratch::new("ok");
+        let amd64 = build(&root.0, "amd64", &plugins());
+        let arm64 = build(&root.0, "arm64", &plugins());
+        let output = root.0.join("release");
+        catalogue_with(&amd64, &arm64, 7, "v1.0.0", REVISION, &output, accept).unwrap();
+        let catalogue: Value =
+            serde_json::from_slice(&fs::read(output.join("assets").join(CATALOGUE)).unwrap())
+                .unwrap();
+        assert_eq!(catalogue["schema_version"], 2);
+        assert_eq!(catalogue["plugins"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            catalogue["plugins"][0]["versions"][0]["artifacts"][1]["asset"],
+            "alpha-1.0.0-linux-arm64.tar.gz"
+        );
+        let inventory = read_inventory(&output.join("inventory.json")).unwrap();
+        assert_eq!(inventory.assets.len(), 7);
+        let sums = fs::read_to_string(output.join("assets").join(SUMS)).unwrap();
+        assert_eq!(sums.lines().count(), 6);
+        assert!(!sums.contains(SUMS));
+        assert_eq!(inventory.inventory_sha256, archive::hash(sums.as_bytes()));
+    }
+
+    #[test]
+    fn production_load_runs_the_real_toolchain_check() {
+        let root = Scratch::new("toolchain");
+        let amd64 = build(&root.0, "amd64", &plugins());
+        let arm64 = build(&root.0, "arm64", &plugins());
+        let error = catalogue(&amd64, &arm64, 7, "v1.0.0", REVISION, &root.0.join("out"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid Rust runtime provenance"), "{error}");
+    }
+
+    /// Each damage is a build that is not what the expected repository,
+    /// revision and plugin set produced. The refusal must name the reason.
+    #[test]
+    fn damaged_builds_are_refused_before_any_output() {
+        type Damage = fn(&Path, &Path);
+        let cases: [(&str, Damage, &str); 9] = [
+            (
+                "source archive bytes",
+                |_, arm64| {
+                    let path = arm64.join(source_archive_name(REVISION));
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.push(0);
+                    fs::write(path, bytes).unwrap();
+                },
+                "arm64 source archive differs from its record",
+            ),
+            (
+                "duplicate plugin",
+                |_, arm64| {
+                    edit_build(arm64, |build| {
+                        let first = build["packages"][0].clone();
+                        build["packages"].as_array_mut().unwrap().push(first);
+                    })
+                },
+                "arm64 package alpha profile mismatch",
+            ),
+            (
+                "name with another version",
+                |_, arm64| {
+                    fs::rename(
+                        arm64.join("alpha-1.0.0-linux-arm64.tar.gz"),
+                        arm64.join("alpha-1.0.1-linux-arm64.tar.gz"),
+                    )
+                    .unwrap();
+                    edit_build(arm64, |build| {
+                        build["packages"][0]["name"] = "alpha-1.0.1-linux-arm64.tar.gz".into()
+                    });
+                },
+                "manifest, name or source record mismatch",
+            ),
+            (
+                "name outside the build",
+                |_, arm64| {
+                    edit_build(arm64, |build| {
+                        build["packages"][0]["name"] = "alpha-../../x-linux-arm64.tar.gz".into()
+                    })
+                },
+                "is not a package of alpha",
+            ),
+            (
+                "package of another architecture",
+                |amd64, arm64| {
+                    fs::copy(
+                        amd64.join("alpha-1.0.0-linux-amd64.tar.gz"),
+                        arm64.join("alpha-1.0.0-linux-arm64.tar.gz"),
+                    )
+                    .unwrap();
+                    let bytes = fs::read(amd64.join("alpha-1.0.0-linux-amd64.tar.gz")).unwrap();
+                    let members: Value = serde_json::from_slice::<Value>(
+                        &fs::read(amd64.join("build.json")).unwrap(),
+                    )
+                    .unwrap()["packages"][0]["artifact"]["members"]
+                        .clone();
+                    edit_build(arm64, |build| {
+                        build["packages"][0]["artifact"]["size"] = (bytes.len() as u64).into();
+                        build["packages"][0]["artifact"]["sha256"] = archive::hash(&bytes).into();
+                        build["packages"][0]["artifact"]["members"] = members.clone();
+                    });
+                },
+                "not a matching Linux ELF64 executable",
+            ),
+            (
+                "source archive replaced without repacking its packages",
+                |_, arm64| {
+                    let name = source_archive_name(REVISION);
+                    let source = archive::Files::from([(
+                        "source/README".to_owned(),
+                        (b"other".to_vec(), false),
+                    )]);
+                    fs::remove_file(arm64.join(&name)).unwrap();
+                    archive::pack(&arm64.join(&name), &source).unwrap();
+                    let sha = archive::hash(&fs::read(arm64.join(&name)).unwrap());
+                    edit_build(arm64, |build| build["source_sha256"] = sha.clone().into());
+                },
+                "manifest, name or source record mismatch",
+            ),
+            (
+                "repository of the build",
+                |_, arm64| edit_build(arm64, |build| build["repository_id"] = 8.into()),
+                "arm64 build is not this repository",
+            ),
+            (
+                "unknown build field",
+                |_, arm64| edit_build(arm64, |build| build["extra"] = true.into()),
+                "unknown field",
+            ),
+            (
+                "duplicate key in build record",
+                |_, arm64| {
+                    let path = arm64.join("build.json");
+                    let text = fs::read_to_string(&path).unwrap();
+                    fs::write(&path, text.replacen("{", "{\"schema_version\":1,", 1)).unwrap();
+                },
+                "duplicate JSON key: schema_version",
+            ),
+        ];
+        for (name, damage, reason) in cases {
+            let root = Scratch::new("damage");
+            let amd64 = build(&root.0, "amd64", &plugins());
+            let arm64 = build(&root.0, "arm64", &plugins());
+            damage(&amd64, &arm64);
+            let output = root.0.join("release");
+            let error = catalogue_with(&amd64, &arm64, 7, "v1.0.0", REVISION, &output, accept)
+                .err()
+                .map(|error| error.to_string());
+            assert!(
+                error.as_deref().is_some_and(|error| error.contains(reason)),
+                "{name}: {error:?}"
+            );
+            assert!(
+                !output.join("assets").join(CATALOGUE).exists(),
+                "{name} wrote a catalogue"
+            );
+        }
+    }
+
+    #[test]
+    fn architectures_must_ship_the_same_manifests() {
+        let root = Scratch::new("manifests");
+        let amd64 = build(&root.0, "amd64", &plugins());
+        let arm64 = build(
+            &root.0,
+            "arm64",
+            &[
+                ("alpha", manifest("alpha", "changed")),
+                ("beta", manifest("beta", "second")),
+            ],
+        );
+        let error = catalogue_with(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            accept,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("differ in source delivery, plugin set or manifest bytes"),
+            "{error}"
+        );
+        let root = Scratch::new("sources");
+        let amd64 = build(&root.0, "amd64", &plugins());
+        let arm64 = build_from(&root.0, "arm64", &plugins(), b"other");
+        assert!(catalogue_with(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            accept
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("differ in source delivery, plugin set or manifest bytes"));
+        let root = Scratch::new("plugin-set");
+        let amd64 = build(&root.0, "amd64", &plugins());
+        let arm64 = build(&root.0, "arm64", &plugins()[..1]);
+        assert!(catalogue_with(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            accept
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("differ in source delivery, plugin set or manifest bytes"));
+    }
+
+    #[test]
+    fn release_limits_and_arguments_are_enforced() {
+        let large = "x".repeat(200 * 1024);
+        let many = (0..6)
+            .map(|index| format!("big-{index}"))
+            .collect::<Vec<_>>();
+        let big = many
+            .iter()
+            .map(|id| (id.as_str(), manifest(id, &large)))
+            .collect::<Vec<_>>();
+        let root = Scratch::new("bytes");
+        let amd64 = build(&root.0, "amd64", &big);
+        let arm64 = build(&root.0, "arm64", &big);
+        assert!(catalogue_with(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            accept
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("above the host's 1 MiB limit"));
+        let ids = (0..31)
+            .map(|index| format!("p-{index}"))
+            .collect::<Vec<_>>();
+        let set = ids
+            .iter()
+            .map(|id| (id.as_str(), manifest(id, "d")))
+            .collect::<Vec<_>>();
+        let root = Scratch::new("assets");
+        let amd64 = build(&root.0, "amd64", &set);
+        let arm64 = build(&root.0, "arm64", &set);
+        assert!(catalogue_with(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            accept
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("65 release assets exceed the limit of 64"));
+        for (repository, tag, revision) in [
+            (0, "v1.0.0", REVISION),
+            (7, "v 1", REVISION),
+            (7, "v1.0.0", "short"),
+        ] {
+            assert!(catalogue_with(
+                &amd64,
+                &arm64,
+                repository,
+                tag,
+                revision,
+                &root.0.join("bad"),
+                accept
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expected repository ID, revision and tag are malformed"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn a_binding_must_describe_the_same_release_as_the_inventory() {
+        let directory =
+            std::env::temp_dir().join(format!("among-author-binding-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let inventory = directory.join("inventory.json");
+        archive::json(
+            &inventory,
+            &Inventory {
+                repository_id: 7,
+                tag: "v1.0.0".into(),
+                revision: "b".repeat(40),
+                inventory_sha256: "c".repeat(64),
+                assets: Vec::new(),
+            },
+        )
+        .unwrap();
+        for (workflow, run) in [
+            ("has space", 1),
+            ("", 1),
+            ("owner/repo/w.yml@refs/tags/v1", 0),
+        ] {
+            assert!(binding(
+                &inventory,
+                workflow,
+                run,
+                &directory.join(format!("bad-{run}-{}", workflow.len()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("workflow ref or run ID is malformed"));
+        }
+        let other = directory.join("other");
+        let line = format!(
+            "{BINDING_PREFIX}{}\n",
+            serde_json::to_string(&Binding {
+                repository_id: 7,
+                workflow_ref: "w".into(),
+                run_id: 1,
+                tag: "v1.0.0".into(),
+                commit: "b".repeat(40),
+                inventory_sha256: "f".repeat(64),
+            })
+            .unwrap()
+        );
+        fs::write(&other, &line).unwrap();
+        let release = directory.join("release.json");
+        fs::write(
+            &release,
+            serde_json::to_vec(&json!({"id": 1, "tag_name": "v1.0.0", "draft": true,
+            "prerelease": false, "body": line, "assets": []}))
+            .unwrap(),
+        )
+        .unwrap();
+        let error = verify_release(Stage::Resume, &release, &inventory, &other, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("binding and inventory describe different releases"),
+            "{error}"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod host_example_tests {
+    use super::*;
+
+    /// Among's `examples/managed-manifest.json` at the time of writing,
+    /// including a number default, an enum and a secret field: the opaque
+    /// handling must keep every byte the host's parser will read.
+    const HOST_EXAMPLE: &str = r#"{
+  "schema_version": 1,
+  "id": "sample-status",
+  "version": "1.0.0",
+  "name": "Sample status",
+  "description": "Static manifest and settings vocabulary example, not an installed plugin.",
+  "entrypoint": "bin/sample-status",
+  "icon": "theme:utilities-terminal-symbolic",
+  "api": { "major": 1, "minor": 2 },
+  "required_features": ["status", "settings"],
+  "optional_features": [],
+  "settings": {
+    "version": 1,
+    "apply": "live",
+    "fields": [
+      { "key": "enabled-meter", "label": "Show meter", "kind": "boolean", "default": true },
+      { "key": "interval", "label": "Refresh seconds", "kind": "integer", "min": 1, "max": 60, "default": 5 },
+      { "key": "threshold", "label": "Warning threshold", "kind": "number", "min": 0, "max": 1, "default": 0.8 },
+      { "key": "label", "label": "Label", "kind": "string", "max_length": 64, "default": "Status" },
+      { "key": "style", "label": "Style", "kind": "enum", "choices": [
+        { "value": "plain", "label": "Plain" },
+        { "value": "compact", "label": "Compact" }
+      ], "default": "plain" },
+      { "key": "credential", "label": "Credential (unavailable)", "kind": "secret", "required": false }
+    ]
+  },
+  "delivery_channels": []
+}
+"#;
+
+    #[test]
+    fn the_host_example_manifest_is_packed_byte_for_byte() {
+        let root = std::env::temp_dir().join(format!("among-author-host-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("plugins/sample-status")).unwrap();
+        fs::write(
+            root.join("plugins/sample-status/among-plugin.json"),
+            HOST_EXAMPLE,
+        )
+        .unwrap();
+        let plugins = declared(&root).unwrap();
+        assert_eq!(plugins[0].manifest, HOST_EXAMPLE.as_bytes());
+        assert_eq!(plugins[0].entrypoint, "bin/sample-status");
+        assert_eq!(plugins[0].icon, None);
+        let parsed = strict::parse(&plugins[0].manifest).unwrap();
+        assert_eq!(parsed["settings"]["fields"][2]["default"], 0.8);
+        assert_eq!(parsed["settings"]["fields"].as_array().unwrap().len(), 6);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
