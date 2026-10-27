@@ -153,7 +153,7 @@ fn manifest(root: &Path, id: &str) -> Result<(Manifest, Vec<u8>)> {
     Ok((manifest, bytes))
 }
 
-fn version(value: &str) -> Result<[u16; 3]> {
+pub(crate) fn version(value: &str) -> Result<[u16; 3]> {
     let mut result = [0; 3];
     let parts: Vec<_> = value.split('.').collect();
     if parts.is_empty() || parts.len() > 3 {
@@ -240,7 +240,7 @@ pub fn elf(bytes: &[u8], architecture: &str) -> Result<()> {
     Ok(())
 }
 
-fn native(path: &Path, architecture: &str) -> Result<(Runtime, Vec<String>)> {
+pub(crate) fn native(path: &Path, architecture: &str) -> Result<(Runtime, Vec<String>)> {
     elf(&archive::read(path, archive::MAX_FILE)?, architecture)?;
     let versions = process::text(
         Command::new("readelf")
@@ -315,7 +315,34 @@ fn system_library(name: &str, architecture: &str) -> bool {
         )
 }
 
-fn delivery(root: &Path, vendor: &Path) -> Result<(source::Collector, archive::Files)> {
+/// What a source and licence delivery collects besides the tracked files and
+/// vendored crates. The official repository also delivers the provenance of
+/// its extraction from Among; an author's repository has none.
+pub(crate) struct Delivery<'a> {
+    pub legal_required: &'a [&'a str],
+    pub legal_optional: &'a [&'a str],
+    /// Cargo manifests whose dependency graphs must be vendored and licensed;
+    /// `None` is the repository's root manifest.
+    pub manifests: &'a [Option<&'a str>],
+}
+
+pub(crate) const OFFICIAL: Delivery<'static> = Delivery {
+    legal_required: &[
+        "LICENSE",
+        "NOTICE",
+        "PROVENANCE.md",
+        "provenance/among-NOTICE",
+        "provenance/UPSTREAM.sha256",
+    ],
+    legal_optional: &[],
+    manifests: &[None, Some("tools/among-tools/Cargo.toml")],
+};
+
+pub(crate) fn delivery(
+    root: &Path,
+    vendor: &Path,
+    inputs: &Delivery,
+) -> Result<(source::Collector, archive::Files)> {
     let mut source = source::Collector::new(32768, 256 * 1024 * 1024);
     let tracked = process::capture(
         Command::new("git")
@@ -336,42 +363,32 @@ fn delivery(root: &Path, vendor: &Path) -> Result<(source::Collector, archive::F
     }
     source.walk(vendor, "vendor", 0)?;
     let mut legal = BTreeMap::new();
-    for path in [
-        "LICENSE",
-        "NOTICE",
-        "PROVENANCE.md",
-        "provenance/among-NOTICE",
-        "provenance/UPSTREAM.sha256",
-    ] {
+    for path in inputs.legal_required.iter().chain(
+        inputs
+            .legal_optional
+            .iter()
+            .filter(|path| fs::symlink_metadata(root.join(path)).is_ok()),
+    ) {
         legal.insert(
-            path.into(),
+            (*path).into(),
             (archive::read(&root.join(path), archive::MAX_FILE)?, false),
         );
     }
-    let metadata_root: Value = serde_json::from_slice(&process::capture(
-        Command::new("cargo").current_dir(root).args([
-            "metadata",
-            "--locked",
-            "--offline",
-            "--format-version=1",
-        ]),
-        &[],
-        8 * 1024 * 1024,
-    )?)?;
-    let metadata_tool: Value = serde_json::from_slice(&process::capture(
-        Command::new("cargo").current_dir(root).args([
-            "metadata",
-            "--manifest-path",
-            "tools/among-tools/Cargo.toml",
-            "--locked",
-            "--offline",
-            "--format-version=1",
-        ]),
-        &[],
-        8 * 1024 * 1024,
-    )?)?;
+    let mut graphs = Vec::new();
+    for manifest in inputs.manifests {
+        let mut arguments = vec!["metadata"];
+        if let Some(manifest) = manifest {
+            arguments.extend(["--manifest-path", manifest]);
+        }
+        arguments.extend(["--locked", "--offline", "--format-version=1"]);
+        graphs.push(serde_json::from_slice::<Value>(&process::capture(
+            Command::new("cargo").current_dir(root).args(&arguments),
+            &[],
+            8 * 1024 * 1024,
+        )?)?);
+    }
     let mut dependencies = BTreeMap::new();
-    for metadata in [metadata_root, metadata_tool] {
+    for metadata in graphs {
         for package in metadata["packages"]
             .as_array()
             .ok_or("missing Cargo package metadata")?
@@ -433,7 +450,7 @@ fn delivery(root: &Path, vendor: &Path) -> Result<(source::Collector, archive::F
 pub fn build(root: &Path, binaries: &Path, vendor: &Path, output: &Path) -> Result<()> {
     let revision = revision(root)?;
     let architecture = architecture()?.to_owned();
-    let (mut source, legal) = delivery(root, vendor)?;
+    let (mut source, legal) = delivery(root, vendor, &OFFICIAL)?;
     let rust = toolchain::collect(&architecture)?;
     for (path, (bytes, _)) in &rust.common {
         source.insert(format!("toolchain/{path}"), bytes.clone())?;

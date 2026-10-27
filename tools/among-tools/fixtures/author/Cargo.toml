@@ -1,0 +1,14 @@
+# A minimal plugin author repository for the author-packages integration
+# check. It is copied into a fresh git repository in CI, never built here.
+[package]
+name = "fixture-status"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "fixture-status"
+path = "src/main.rs"

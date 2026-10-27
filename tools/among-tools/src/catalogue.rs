@@ -64,7 +64,7 @@ fn api(path: &str, maximum: usize, deadline: Instant) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn tag_name(tag: &str) -> bool {
+pub(crate) fn tag_name(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 256
         && tag.split('/').count() <= 16
@@ -81,12 +81,18 @@ fn tag_name(tag: &str) -> bool {
 }
 
 fn binding(tag: &str, deadline: Instant) -> Result<Value> {
+    binding_in(package::REPOSITORY, tag, deadline)
+}
+
+/// Resolves `refs/tags/<tag>` of the numeric repository to its commit,
+/// peeling at most eight annotated tag objects.
+pub(crate) fn binding_in(repository: u64, tag: &str, deadline: Instant) -> Result<Value> {
     if !tag_name(tag) {
         return Err("unsupported exact release tag".into());
     }
     let reference = format!("refs/tags/{tag}");
     let value = api(
-        &format!("repositories/{}/git/ref/tags/{tag}", package::REPOSITORY),
+        &format!("repositories/{}/git/ref/tags/{tag}", repository),
         64 * 1024,
         deadline,
     )?;
@@ -111,7 +117,7 @@ fn binding(tag: &str, deadline: Instant) -> Result<Value> {
         match kind.as_str() {
             "commit" => {
                 let commit = api(
-                    &format!("repositories/{}/git/commits/{sha}", package::REPOSITORY),
+                    &format!("repositories/{}/git/commits/{sha}", repository),
                     64 * 1024,
                     deadline,
                 )?;
@@ -122,7 +128,7 @@ fn binding(tag: &str, deadline: Instant) -> Result<Value> {
             }
             "tag" if chain.len() <= 8 => {
                 let object = api(
-                    &format!("repositories/{}/git/tags/{sha}", package::REPOSITORY),
+                    &format!("repositories/{}/git/tags/{sha}", repository),
                     64 * 1024,
                     deadline,
                 )?;

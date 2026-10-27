@@ -112,3 +112,182 @@ jobs:
           path: ${{ runner.temp }}/managed-system-measurements-${{ matrix.kernel }}/
           if-no-files-found: warn
           retention-days: 5
+
+  packager-regression:
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            kernel: x86_64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            kernel: aarch64
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '1'
+      EXPECTED_KERNEL: ${{ matrix.kernel }}
+      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
+      # The official 0.1.0-rc.1 source. The changed tool must package it
+      # byte for byte like the tool of that commit, from the same inputs.
+      BASELINE: aa1ec272d4ed6326338f3de0e5fbf30bbe181e39
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: head
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ env.BASELINE }}
+          path: baseline
+      - name: Require the native build architecture
+        run: test "$(uname -m)" = "$EXPECTED_KERNEL"
+      - name: Install the pinned Rust tools
+        run: rustup toolchain install 1.98.1 --profile minimal --component rust-docs --component rust-src
+      - name: Package the official source with the previous and the changed tool
+        run: |
+          set -euo pipefail
+          cargo +1.98.1 build --locked --manifest-path baseline/tools/among-tools/Cargo.toml
+          cargo +1.98.1 build --locked --manifest-path head/tools/among-tools/Cargo.toml
+          changed="$PWD/head/tools/among-tools/target/debug/among-tools"
+          cd baseline
+          test "$(git rev-parse HEAD)" = "$BASELINE"
+          cargo +1.98.1 build --release --locked --bins
+          cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > /dev/null
+          tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$RUNNER_TEMP/previous"
+          "$changed" plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$RUNNER_TEMP/changed"
+          cd "$RUNNER_TEMP/previous"
+          # checks-<pid> holds smoke-test output named by process ID; the
+          # delivered files are compared byte for byte.
+          packages=$(find . -maxdepth 1 -name '*.tar.gz' -printf '%f\n' | sort)
+          test "$(printf '%s\n' "$packages" | wc -l)" -eq 4
+          for file in build.json SHA256SUMS $packages; do
+            cmp "$RUNNER_TEMP/previous/$file" "$RUNNER_TEMP/changed/$file"
+          done
+          echo "official packaging of $BASELINE is byte-identical on ${{ matrix.architecture }}"
+
+  author-packages:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            kernel: x86_64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            kernel: aarch64
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '1'
+      EXPECTED_KERNEL: ${{ matrix.kernel }}
+      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
+      # Fixed dates give the fixture commit the same SHA on both runners, as
+      # one tagged author commit has.
+      GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z'
+      GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Require the native build architecture
+        run: test "$(uname -m)" = "$EXPECTED_KERNEL"
+      - name: Install the pinned Rust tools
+        run: rustup toolchain install 1.98.1 --profile minimal --component rust-docs --component rust-src
+      - name: Package the author fixture as an author repository
+        run: |
+          set -euo pipefail
+          cargo +1.98.1 build --locked --manifest-path tools/among-tools/Cargo.toml
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          author="$RUNNER_TEMP/author"
+          cp -R tools/among-tools/fixtures/author "$author"
+          cd "$author"
+          git init -q
+          printf '/target/\n/vendor/\n' > .git/info/exclude
+          git add -A
+          git -c user.name=fixture -c user.email=fixture@invalid commit -q -m fixture
+          cargo +1.98.1 build --release --locked --bins
+          mkdir vendor
+          cargo +1.98.1 vendor --locked --versioned-dirs vendor > /dev/null
+          output="$RUNNER_TEMP/author-${{ matrix.architecture }}"
+          "$tool" author-packages "$PWD" "$PWD/target/release" "$PWD/vendor" 7 "$output"
+          git rev-parse HEAD > "$RUNNER_TEMP/fixture-revision"
+          cp "$RUNNER_TEMP/fixture-revision" "$output/fixture-revision"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: author-fixture-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/author-${{ matrix.architecture }}/
+          if-no-files-found: error
+          retention-days: 5
+
+  author-catalogue:
+    needs: author-packages
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install the pinned Rust tools
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: author-fixture-amd64
+          path: ${{ runner.temp }}/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: author-fixture-arm64
+          path: ${{ runner.temp }}/arm64
+      - name: Schema 2 catalogue from both architectures, and refusals
+        run: |
+          set -euo pipefail
+          cargo +1.98.1 build --locked --manifest-path tools/among-tools/Cargo.toml
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          cd "$RUNNER_TEMP"
+          cmp amd64/fixture-revision arm64/fixture-revision
+          revision=$(cat amd64/fixture-revision)
+          "$tool" author-catalogue amd64 arm64 7 v1.0.0 "$revision" release
+          (cd release/assets && sha256sum -c SHA256SUMS)
+          jq -e '.schema_version == 2 and (.plugins | length) == 1
+            and .plugins[0].id == "fixture-status"
+            and (.plugins[0].versions | length) == 1
+            and .plugins[0].versions[0].revision == $revision
+            and ([.plugins[0].versions[0].artifacts[].architecture] == ["amd64", "arm64"])
+            and ([.plugins[0].versions[0].artifacts[].asset] == ["fixture-status-1.0.0-linux-amd64.tar.gz", "fixture-status-1.0.0-linux-arm64.tar.gz"])
+            and .plugins[0].versions[0].manifest.settings.fields[0].key == "interval"' \
+            --arg revision "$revision" release/assets/among-plugins.json
+          test "$(jq '.assets | length' release/inventory.json)" -eq 5
+          "$tool" release-binding release/inventory.json owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0 1 binding
+          grep -q '^among-release-binding: {' binding
+          refuse() {
+            reason="$1"; shift
+            if "$@" 2> refusal.txt; then echo "accepted: $*"; exit 1; fi
+            grep -F "$reason" refusal.txt || { cat refusal.txt; exit 1; }
+          }
+          refuse 'is not this repository, revision and architecture' \
+            "$tool" author-catalogue amd64 arm64 8 v1.0.0 "$revision" other-repository
+          refuse 'is not this repository, revision and architecture' \
+            "$tool" author-catalogue amd64 arm64 7 v1.0.0 "$(printf 'c%.0s' $(seq 40))" other-revision
+          refuse 'is not this repository, revision and architecture' \
+            "$tool" author-catalogue arm64 amd64 7 v1.0.0 "$revision" swapped
+          cp -R arm64 tampered
+          jq '.packages[0].manifest_sha256 = ("0" * 64)' arm64/build.json > tampered/build.json
+          refuse 'manifest, name or source record mismatch' \
+            "$tool" author-catalogue amd64 tampered 7 v1.0.0 "$revision" tampered-out
+          cp -R arm64 resized
+          printf 'x' >> "resized/$(jq -r '.packages[0].name' arm64/build.json)"
+          refuse 'differs from its record' \
+            "$tool" author-catalogue amd64 resized 7 v1.0.0 "$revision" resized-out
