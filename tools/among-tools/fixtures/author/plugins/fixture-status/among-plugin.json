@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "fixture-status",
+  "version": "1.0.0",
+  "name": "Fixture status",
+  "description": "Integration fixture for the author packaging tools, not a published plugin.",
+  "entrypoint": "bin/fixture-status",
+  "icon": "theme:utilities-terminal-symbolic",
+  "api": { "major": 1, "minor": 2 },
+  "required_features": ["status", "settings"],
+  "optional_features": [],
+  "settings": {
+    "version": 1,
+    "apply": "live",
+    "fields": [
+      { "key": "interval", "label": "Refresh seconds", "kind": "integer", "min": 1, "max": 60, "default": 5 }
+    ]
+  },
+  "delivery_channels": []
+}

@@ -1,0 +1,307 @@
+name: Plugin release
+
+# Called by a plugin author's repository on a version tag:
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#   concurrency:
+#     group: plugin-release-${{ github.ref }}
+#     cancel-in-progress: false
+#   jobs:
+#     release:
+#       permissions:
+#         contents: write
+#       uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@<commit SHA>
+#
+# It builds the plugins on native amd64 and arm64 runners, packages them with
+# among-tools from this repository at exactly the called commit, and publishes
+# an immutable GitHub release with both packages, the source delivery, the
+# schema 2 catalogue among-plugins.json and SHA256SUMS. Only the publish job
+# can write, and it runs no code of the author's repository. The caller sets
+# the per-tag concurrency group: a group here could deadlock with the caller's.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.pin.outputs.commit }}
+      tag: ${{ steps.pin.outputs.tag }}
+    steps:
+      - name: Pin the tagged source commit without running author code
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/tags/v*) tag="${REF#refs/tags/}" ;;
+            *) echo "plugin releases run on a v* tag, not $REF" >&2; exit 1 ;;
+          esac
+          printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
+          printf '%s' "$tag" | grep -Eqx '[A-Za-z0-9._-]{1,128}'
+          # Peel annotated tags through the API of the numeric repository.
+          kind=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.type)
+          object=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.sha)
+          for _ in 1 2 3 4 5 6 7 8; do
+            [ "$kind" = commit ] && break
+            [ "$kind" = tag ] || { echo "tag $tag points to a $kind" >&2; exit 1; }
+            next=$(gh api "repositories/$REPOSITORY_ID/git/tags/$object")
+            kind=$(printf '%s' "$next" | jq -r .object.type)
+            object=$(printf '%s' "$next" | jq -r .object.sha)
+          done
+          if [ "$kind" != commit ] || [ "$object" != "$SHA" ]; then
+            echo "tag $tag resolves to $object, not the event commit $SHA" >&2
+            exit 1
+          fi
+          echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  tools-amd64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - name: Require the native build architecture
+        run: test "$(uname -m)" = x86_64
+      - name: Refuse anything but the official tool repository
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test "$WORKFLOW_REPOSITORY" = Among-Terminal/among-plugins
+          printf '%s' "$WORKFLOW_SHA" | grep -Eqx '[0-9a-f]{40}'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: among-plugins
+      - name: Build among-tools at the called commit
+        id: digest
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 build --release --locked --manifest-path among-plugins/tools/among-tools/Cargo.toml
+          mkdir tools
+          cp among-plugins/tools/among-tools/target/release/among-tools tools/among-tools
+          echo "sha256=$(sha256sum tools/among-tools | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: among-tools-amd64
+          path: tools/among-tools
+          if-no-files-found: error
+          retention-days: 5
+
+  tools-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    outputs:
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - name: Require the native build architecture
+        run: test "$(uname -m)" = aarch64
+      - name: Refuse anything but the official tool repository
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test "$WORKFLOW_REPOSITORY" = Among-Terminal/among-plugins
+          printf '%s' "$WORKFLOW_SHA" | grep -Eqx '[0-9a-f]{40}'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: among-plugins
+      - name: Build among-tools at the called commit
+        id: digest
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          cargo +1.98.1 build --release --locked --manifest-path among-plugins/tools/among-tools/Cargo.toml
+          mkdir tools
+          cp among-plugins/tools/among-tools/target/release/among-tools tools/among-tools
+          echo "sha256=$(sha256sum tools/among-tools | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: among-tools-arm64
+          path: tools/among-tools
+          if-no-files-found: error
+          retention-days: 5
+
+  build:
+    needs: [pin, tools-amd64, tools-arm64]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            kernel: x86_64
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            kernel: aarch64
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_BUILD_JOBS: '1'
+      RUSTUP_TOOLCHAIN: 1.98.1
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
+    steps:
+      - name: Require the native build architecture
+        run: test "$(uname -m)" = "${{ matrix.kernel }}"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ needs.pin.outputs.commit }}
+          path: author
+      - name: Refuse a checkout other than the pinned commit
+        env:
+          PIN: ${{ needs.pin.outputs.commit }}
+        run: test "$(git -C author rev-parse HEAD)" = "$PIN"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ matrix.architecture == 'amd64' && needs['tools-amd64'].outputs.artifact || needs['tools-arm64'].outputs.artifact }}
+          path: tools
+          merge-multiple: true
+      - name: Accept only the tool built by the tools job
+        env:
+          EXPECTED: ${{ matrix.architecture == 'amd64' && needs['tools-amd64'].outputs.sha256 || needs['tools-arm64'].outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          test -f tools/among-tools && test ! -L tools/among-tools
+          test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
+          chmod 755 tools/among-tools
+      - name: Check and build the plugins
+        working-directory: author
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --component rust-docs --component rust-src
+          cargo +1.98.1 fmt --all --check
+          cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+          cargo +1.98.1 test --locked --all-targets
+          cargo +1.98.1 build --release --locked --bins
+      - name: Package with the verified tool
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          cd author
+          printf '/target/\n/vendor/\n' >> .git/info/exclude
+          mkdir vendor
+          cargo +1.98.1 vendor --locked --versioned-dirs vendor > /dev/null
+          ../tools/among-tools author-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$REPOSITORY_ID" "$RUNNER_TEMP/build-${{ matrix.architecture }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plugin-build-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/build-${{ matrix.architecture }}/
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    needs: [pin, tools-amd64, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      # No checkout of the author's repository and no cargo here: build
+      # artifacts are data that among-tools checks, never code that runs.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs['tools-amd64'].outputs.artifact }}
+          path: tools
+          merge-multiple: true
+      - name: Accept only the tool built by the tools job
+        env:
+          EXPECTED: ${{ needs['tools-amd64'].outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          test -f tools/among-tools && test ! -L tools/among-tools
+          test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
+          chmod 755 tools/among-tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plugin-build-amd64
+          path: build/amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: plugin-build-arm64
+          path: build/arm64
+      - name: Catalogue, draft, verify, publish, verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          PIN: ${{ needs.pin.outputs.commit }}
+          TAG: ${{ needs.pin.outputs.tag }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tool="$PWD/tools/among-tools"
+          "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
+          "$tool" release-binding release/inventory.json "$WORKFLOW_REF" "$RUN_ID" binding
+          resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
+          test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
+          # Checks a published release against the whole expected snapshot.
+          verify_published() {
+            resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
+            test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
+            gh api "repositories/$REPOSITORY_ID/releases/$1" > release.json
+            gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
+            "$tool" verify-release published release.json release/inventory.json binding latest.json
+            echo "published $(jq -r .html_url release.json) for $TAG at $PIN"
+          }
+          # Drafts are only visible in the list; at most one may carry this tag.
+          gh api --paginate "repositories/$REPOSITORY_ID/releases?per_page=100" \
+            | jq -s --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]' > existing.json
+          count=$(jq length existing.json)
+          if [ "$count" -gt 1 ]; then echo "more than one release for $TAG" >&2; exit 1; fi
+          if [ "$count" -eq 1 ]; then
+            jq '.[0]' existing.json > release.json
+            id=$(jq -r .id release.json)
+            if [ "$(jq -r .draft release.json)" = false ]; then
+              # An earlier attempt of this run published and stopped before
+              # its final check; the binding check refuses any other release.
+              verify_published "$id"
+              exit 0
+            fi
+            "$tool" verify-release resume release.json release/inventory.json binding > missing.txt
+          else
+            # Drafts cannot be latest; publishing below makes it latest.
+            gh api -X POST "repositories/$REPOSITORY_ID/releases" \
+              -f tag_name="$TAG" -F draft=true -F prerelease=false \
+              -f name="$TAG" -F body=@binding > release.json
+            id=$(jq -r .id release.json)
+            (cd release/assets && ls) > missing.txt
+          fi
+          while read -r name; do
+            [ -n "$name" ] || continue
+            gh release upload "$TAG" "release/assets/$name"
+          done < missing.txt
+          gh api "repositories/$REPOSITORY_ID/releases/$id" > release.json
+          "$tool" verify-release draft release.json release/inventory.json binding
+          gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F draft=false > /dev/null
+          verify_published "$id"
