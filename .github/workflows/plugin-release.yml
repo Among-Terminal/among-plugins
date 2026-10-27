@@ -23,6 +23,13 @@ name: Plugin release
 #
 # With `publish: false` (for example on pull requests) it builds, packages and
 # catalogues the event commit, needs only `contents: read` and writes nothing.
+#
+# There is no workflow-level `permissions`: every job except publish lowers
+# its token to `contents: read`, and publish keeps the caller's token. GitHub
+# checks the permissions of every job of a called workflow when the run
+# starts, skipped ones included, so a publish job that asked for
+# `contents: write` itself would make a read-only caller in check mode fail
+# before anything runs. The caller grants exactly `contents: write`.
 
 on:
   workflow_call:
@@ -32,13 +39,12 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
-
 jobs:
   pin:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       commit: ${{ steps.pin.outputs.commit }}
       tag: ${{ steps.pin.outputs.tag }}
@@ -85,6 +91,8 @@ jobs:
   tools-amd64:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
     outputs:
       artifact: ${{ steps.upload.outputs.artifact-id }}
       sha256: ${{ steps.digest.outputs.sha256 }}
@@ -126,6 +134,8 @@ jobs:
   tools-arm64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
+    permissions:
+      contents: read
     outputs:
       artifact: ${{ steps.upload.outputs.artifact-id }}
       sha256: ${{ steps.digest.outputs.sha256 }}
@@ -167,6 +177,8 @@ jobs:
   build:
     needs: [pin, tools-amd64, tools-arm64]
     timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       fail-fast: true
       matrix:
@@ -239,6 +251,8 @@ jobs:
     needs: [pin, tools-amd64, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -276,8 +290,6 @@ jobs:
     needs: [pin, tools-amd64, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: write
     steps:
       # No checkout of the author's repository and no cargo here: build
       # artifacts are data that among-tools checks, never code that runs.

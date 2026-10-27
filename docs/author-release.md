@@ -45,7 +45,10 @@ Reference a full commit SHA. The workflow builds `among-tools` from exactly
 that commit (`job.workflow_sha`) and pins the tagged commit before any of your
 code runs. Your build job checks the tool's SHA-256 before using it; the final
 job, the only one that can write to the repository, downloads the tool again
-by artifact ID and digest and runs none of your code. The repository's Actions
+by artifact ID and digest and runs none of your code. That job takes its token
+from the `permissions` of your calling job, so grant exactly `contents: write`
+there and nothing more; every other job lowers its token to `contents: read`.
+The repository's Actions
 settings must allow public reusable workflows. Tags are `v` followed by
 letters, digits, `.`, `_` or `-` (at most 128 characters); a tag such as
 `v1.0.0+build` is refused.
