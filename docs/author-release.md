@@ -133,6 +133,16 @@ That path does not consume a previously approved candidate and must not be used
 when approval covers exact preparation bytes. No workflow setting supplies owner
 permission to create a tag, draft or published release.
 
+The official repository has a manual caller,
+`.github/workflows/official-plugin-release.yml`, present in the candidate source.
+Its default `publish: false` prepares the event commit. After separate owner
+approval, dispatch that same caller at the approved tag with `publish: true` and
+all three prepared inputs. It refuses absent inputs instead of falling back to a
+fresh build. There is no tag-push publication trigger. The caller and the checks
+workflow pin the same reviewed reusable-tool commit, so preparation and publication
+check the same tool revision even when the plugin source is a later commit.
+Changing that tool pin requires new source review and preparation.
+
 ## What a release contains
 
 - `<id>-<version>-linux-amd64.tar.gz` and `…-arm64.tar.gz` for each plugin,

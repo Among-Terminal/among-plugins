@@ -312,6 +312,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: ./.github/workflows/plugin-release.yml
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
     with:
       publish: false

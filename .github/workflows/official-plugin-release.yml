@@ -1,0 +1,68 @@
+name: Official plugin candidate
+
+# Publication is a separate manual action on an already approved tag. There is
+# no tag-push trigger, and missing approval inputs cannot select a fresh build.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish approved bytes. Requires separate owner approval and the exact approved tag ref.
+        type: boolean
+        default: false
+      prepared-run-id:
+        description: Approved successful preparation run ID.
+        type: string
+        default: ''
+      prepared-artifact-id:
+        description: Approved complete candidate artifact ID.
+        type: string
+        default: ''
+      prepared-sha256sums:
+        description: Approved SHA256 of SHA256SUMS.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-plugin-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ !inputs.publish }}
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
+    with:
+      publish: false
+
+  require-approved-inputs:
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse publication without exact prepared-byte inputs and a version tag
+        env:
+          REF: ${{ github.ref }}
+          PREPARED_RUN: ${{ inputs.prepared-run-id }}
+          PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
+          PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REF" | grep -Eqx 'refs/tags/v[A-Za-z0-9._-]{0,127}'
+          printf '%s' "$PREPARED_RUN" | grep -Eqx '[1-9][0-9]{0,19}'
+          printf '%s' "$PREPARED_ARTIFACT" | grep -Eqx '[1-9][0-9]{0,19}'
+          printf '%s' "$PREPARED_DIGEST" | grep -Eqx '[0-9a-f]{64}'
+
+  publish:
+    if: ${{ inputs.publish }}
+    needs: require-approved-inputs
+    permissions:
+      contents: write
+      actions: read
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
+    with:
+      publish: true
+      prepared-run-id: ${{ inputs.prepared-run-id }}
+      prepared-artifact-id: ${{ inputs.prepared-artifact-id }}
+      prepared-sha256sums: ${{ inputs.prepared-sha256sums }}
