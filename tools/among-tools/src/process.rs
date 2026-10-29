@@ -39,7 +39,8 @@ fn drain(reader: &mut impl Read, bytes: &mut Vec<u8>, maximum: usize) -> Result<
 }
 
 // The deadline covers collection, not OS spawn/reap. Only the direct child is
-// owned: callers use fixed tools, never publisher-supplied shell commands.
+// owned. Callers run fixed tools or, in packaging, the entrypoint just built
+// from the packaging repository itself; never a shell command from a publisher.
 pub fn capture(command: &mut Command, input: &[u8], maximum: usize) -> Result<Vec<u8>> {
     if input.len() > 4096 {
         return Err("subprocess input exceeds one pipe write".into());

@@ -90,9 +90,15 @@ as a process find it under `target/debug`.
 
 ## Publishing approved preparation bytes
 
-For approval before publication, run check mode on the exact accepted source,
-such as a `workflow_dispatch` caller at that commit. A pull request's synthetic
-merge commit is a different source and cannot authorize a later main commit.
+For approval before publication, dispatch the same caller workflow that will
+later publish, in check mode, on the exact accepted source. Publication accepts
+only a preparation run with `event` `workflow_dispatch`, the publishing
+workflow's own `path` and this repository as `head_repository`
+(`among-tools prepared-run`). Every other successful run of the commit, such
+as a push or pull request run of a checks workflow, also uploads a candidate
+under the same name, and rebuilt packages differ byte for byte, so those
+candidates are refused. A pull request's synthetic merge commit is a different
+source and cannot authorize a later main commit.
 Record the successful run ID, candidate artifact ID, source SHA, called workflow
 SHA and SHA256 of the candidate's `assets/SHA256SUMS` bytes. Retain every asset's
 filename, size and SHA256, including `SHA256SUMS` itself from `inventory.json`.
@@ -164,10 +170,18 @@ rather than the 30 the asset limit would allow.
 among-tools author-packages <source-root> <native-binaries> <vendor> <repository-id> <new-output>
 among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output>
 among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
+among-tools prepared-run <run.json> <artifact.json> <repository-id> <source> <run-id> <artifact-id> <workflow-ref>
 among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
 among-tools verify-release resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
 among-tools resolve-tag <repository-id> <tag>
 ```
+
+`author-packages` starts each built entrypoint once before packaging it. It
+sends `managed_hello` with identity `github:<repository-id>/<plugin-id>` and
+exactly the manifest's `required_features`, then `shutdown`, and requires the
+admission back within 30 seconds. A manifest that lost a feature the
+executable requires therefore fails packaging instead of producing a package
+every host would refuse.
 
 `author-catalogue` refuses builds whose repository, revision, plugin set,
 manifest bytes or archives differ from the expected values. A draft created by

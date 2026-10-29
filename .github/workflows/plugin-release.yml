@@ -385,17 +385,15 @@ jobs:
           PIN: ${{ needs.pin.outputs.commit }}
           PREPARED_RUN: ${{ inputs.prepared-run-id }}
           PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -euo pipefail
+          # among-tools prepared-run accepts only a manual run of the workflow
+          # that is now publishing, in this repository, at this source.
           gh api "repositories/$REPOSITORY_ID/actions/runs/$PREPARED_RUN" > preparation-run.json
-          jq -e --arg source "$PIN" --arg run "$PREPARED_RUN" --arg repository "$REPOSITORY_ID" \
-            '.id == ($run|tonumber) and .repository.id == ($repository|tonumber)
-              and .head_sha == $source and .status == "completed" and .conclusion == "success"' preparation-run.json
           gh api "repositories/$REPOSITORY_ID/actions/artifacts/$PREPARED_ARTIFACT" > preparation-artifact.json
-          jq -e --arg source "$PIN" --arg run "$PREPARED_RUN" --arg artifact "$PREPARED_ARTIFACT" \
-            '.id == ($artifact|tonumber) and .workflow_run.id == ($run|tonumber)
-              and .workflow_run.head_sha == $source and .expired == false
-              and .name == ("plugin-release-candidate-" + $source)' preparation-artifact.json
+          tools/among-tools prepared-run preparation-run.json preparation-artifact.json \
+            "$REPOSITORY_ID" "$PIN" "$PREPARED_RUN" "$PREPARED_ARTIFACT" "$WORKFLOW_REF"
       - name: Download the approved candidate without native rebuilds
         if: ${{ needs.pin.outputs.prepared == 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
