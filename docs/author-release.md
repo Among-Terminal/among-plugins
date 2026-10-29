@@ -90,41 +90,71 @@ as a process find it under `target/debug`.
 
 ## Publishing approved preparation bytes
 
-For approval before publication, dispatch the same caller workflow that will
-later publish, in check mode, on the exact accepted source. Publication accepts
-only a preparation run with `event` `workflow_dispatch`, the publishing
-workflow's own `path` and this repository as `head_repository`
-(`among-tools prepared-run`). Every other successful run of the commit, such
-as a push or pull request run of a checks workflow, also uploads a candidate
-under the same name, and rebuilt packages differ byte for byte, so those
-candidates are refused. A pull request's synthetic merge commit is a different
-source and cannot authorize a later main commit.
+Publishing exact approved bytes needs a manually dispatched caller, not the
+tag-push caller above: the run that prepares the bytes and the run that
+publishes them must be runs of the same workflow file. A minimal caller:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      publish: {type: boolean, default: false}
+      prepared-run-id: {type: string, default: ''}
+      prepared-artifact-id: {type: string, default: ''}
+      prepared-sha256sums: {type: string, default: ''}
+      prerelease: {type: boolean, default: false}
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: ${{ !inputs.publish }}
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@<commit SHA>
+    with:
+      publish: false
+  publish:
+    if: ${{ inputs.publish }}
+    permissions:
+      contents: write
+      actions: read
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@<same commit SHA>
+    with:
+      publish: true
+      prepared-run-id: ${{ inputs.prepared-run-id }}
+      prepared-artifact-id: ${{ inputs.prepared-artifact-id }}
+      prepared-sha256sums: ${{ inputs.prepared-sha256sums }}
+      prerelease: ${{ inputs.prerelease }}
+```
+
+For approval, dispatch it with `publish: false` on the exact accepted source.
+Publication accepts only a preparation run with `event` `workflow_dispatch`,
+the publishing workflow's own `path` and this repository as `head_repository`
+(`among-tools prepared-run`). Every other successful run of the commit, such as
+a push or pull request run of a checks workflow, also uploads a candidate under
+the same name, and rebuilt packages differ byte for byte, so those candidates
+are refused. A pull request's synthetic merge commit is a different source and
+cannot authorize a later main commit.
 Record the successful run ID, candidate artifact ID, source SHA, called workflow
 SHA and SHA256 of the candidate's `assets/SHA256SUMS` bytes. Retain every asset's
 filename, size and SHA256, including `SHA256SUMS` itself from `inventory.json`.
 An expired artifact cannot be substituted by a rebuild under the old approval.
 
 After separate tag and release approval, create the approved tag at that exact
-source and call the same full-SHA-pinned reusable workflow with these inputs:
+source and dispatch the same caller at the tag with `publish: true` and all
+three recorded values. All three inputs are required together; partial inputs
+refuse before publication. The publishing job checks the successful
+source-bound run and exact unexpired artifact, then downloads that artifact by
+ID. Native plugin builds are skipped. The tool is built at the same called
+workflow SHA; candidate contents are read as data and never executed in the
+publishing job.
 
-```yaml
-permissions:
-  contents: write
-  actions: read
-uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@<same full workflow SHA>
-with:
-  publish: true
-  prepared-run-id: '<approved run ID>'
-  prepared-artifact-id: '<approved artifact ID>'
-  prepared-sha256sums: '<approved SHA256 of SHA256SUMS>'
-```
-
-These are job fields inside the tag caller, not a workflow to dispatch before
-approval. All three inputs are required together; partial inputs refuse before
-publication. The publishing job checks the successful source-bound run and exact
-unexpired artifact, then downloads that artifact by ID. Native plugin builds are
-skipped. The tool is built at the same called workflow SHA; candidate contents
-are read as data and never executed in the publishing job.
+With `prerelease: true` the release is published as a GitHub prerelease. It
+never becomes the latest release, so ordinary installation does not see it;
+Among's development mode installs it for testing. The bytes are the approved
+preparation, exactly as for a stable release. A release candidate can
+therefore be published first under a tag such as `v1.0.0-rc.1`, and after it
+has been checked, the same preparation can be published under the stable tag
+at the same commit, as long as the artifact has not expired. A rebuild would
+produce different package bytes and needs a new preparation and approval.
 
 `prepared-inventory` checks the complete regular-file asset set, canonical
 checksum listing, approved digest, repository/source bindings and schema2
@@ -172,16 +202,21 @@ among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <
 among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
 among-tools prepared-run <run.json> <artifact.json> <repository-id> <source> <run-id> <artifact-id> <workflow-ref>
 among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
-among-tools verify-release resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
+among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
 among-tools resolve-tag <repository-id> <tag>
 ```
 
 `author-packages` starts each built entrypoint once before packaging it. It
 sends `managed_hello` with identity `github:<repository-id>/<plugin-id>` and
 exactly the manifest's `required_features`, then `shutdown`, and requires the
-admission back within 30 seconds. A manifest that lost a feature the
-executable requires therefore fails packaging instead of producing a package
-every host would refuse.
+admission back within 30 seconds. The answer is judged as the host judges it:
+the same version, identity, session and generation, and features that were
+offered and include every required one; feature order and fields the host
+ignores do not matter. A manifest that lost a feature the executable requires
+therefore fails packaging instead of producing a package every host would
+refuse. In a fork the repository ID differs from the identity compiled into
+the plugin, so check mode fails there too: a host would not admit a package
+installed from that fork either.
 
 `author-catalogue` refuses builds whose repository, revision, plugin set,
 manifest bytes or archives differ from the expected values. A draft created by

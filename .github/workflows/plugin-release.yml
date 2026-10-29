@@ -55,6 +55,10 @@ on:
         description: Owner-approved lowercase SHA256 of the SHA256SUMS bytes, not inventory.json.
         type: string
         default: ''
+      prerelease:
+        description: Publish a prerelease, which development mode installs and which never becomes the latest release.
+        type: boolean
+        default: false
 
 jobs:
   pin:
@@ -418,9 +422,11 @@ jobs:
           PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
           TOOL_REPOSITORY: ${{ job.workflow_repository }}
           TOOL_REVISION: ${{ job.workflow_sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           tool="$PWD/tools/among-tools"
+          if [ "$PRERELEASE" = true ]; then channel=prerelease; else channel=stable; fi
           inventory="$PWD/release/inventory.json"
           if [ "$PREPARED" = true ]; then
             jq -e --arg repository "$REPOSITORY_ID" --arg source "$PIN" --arg run "$PREPARED_RUN" \
@@ -440,8 +446,16 @@ jobs:
             resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
             test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
             gh api "repositories/$REPOSITORY_ID/releases/$1" > release.json
-            gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
-            "$tool" verify-release published release.json "$inventory" binding latest.json
+            if [ "$channel" = stable ]; then
+              gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
+              "$tool" verify-release stable published release.json "$inventory" binding latest.json
+            elif gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json 2> latest.err; then
+              "$tool" verify-release prerelease published release.json "$inventory" binding latest.json
+            else
+              # Before the first stable release there is no latest release.
+              grep -q 'HTTP 404' latest.err
+              "$tool" verify-release prerelease published release.json "$inventory" binding
+            fi
             echo "published $(jq -r .html_url release.json) for $TAG at $PIN"
           }
           # Drafts are only visible in the list; at most one may carry this tag.
@@ -458,11 +472,12 @@ jobs:
               verify_published "$id"
               exit 0
             fi
-            "$tool" verify-release resume release.json "$inventory" binding > missing.txt
+            "$tool" verify-release "$channel" resume release.json "$inventory" binding > missing.txt
           else
-            # Drafts cannot be latest; publishing below makes it latest.
+            # Drafts cannot be latest; publishing below makes a stable release
+            # latest, while a prerelease never becomes latest.
             gh api -X POST "repositories/$REPOSITORY_ID/releases" \
-              -f tag_name="$TAG" -F draft=true -F prerelease=false \
+              -f tag_name="$TAG" -F draft=true -F prerelease="$PRERELEASE" \
               -f name="$TAG" -F body=@binding > release.json
             id=$(jq -r .id release.json)
             (cd release/assets && ls) > missing.txt
@@ -472,6 +487,6 @@ jobs:
             gh release upload "$TAG" "release/assets/$name"
           done < missing.txt
           gh api "repositories/$REPOSITORY_ID/releases/$id" > release.json
-          "$tool" verify-release draft release.json "$inventory" binding
+          "$tool" verify-release "$channel" draft release.json "$inventory" binding
           gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F draft=false > /dev/null
           verify_published "$id"
