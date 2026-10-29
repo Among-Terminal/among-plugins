@@ -333,6 +333,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@25398ffca26ca4617472492f3409105c1b360115
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: false

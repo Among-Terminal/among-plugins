@@ -36,7 +36,7 @@ concurrency:
 jobs:
   prepare:
     if: ${{ !inputs.publish }}
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@25398ffca26ca4617472492f3409105c1b360115
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: false
 
@@ -71,7 +71,7 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@25398ffca26ca4617472492f3409105c1b360115
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: true
       prepared-run-id: ${{ inputs.prepared-run-id }}
