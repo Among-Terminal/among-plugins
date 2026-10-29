@@ -128,6 +128,8 @@ fn manifest(root: &Path, id: &str) -> Result<(Manifest, Vec<u8>)> {
             "context.terminals".into(),
             "context.cwd".into(),
         ]
+    } else if id == "system-status" && manifest.required_features == ["status", "system.metrics"] {
+        vec!["status".into(), "system.metrics".into()]
     } else {
         vec!["status".into()]
     };
@@ -675,5 +677,40 @@ mod tests {
             hello["features"],
             json!(["context.cwd", "context.terminals", "status"])
         );
+    }
+
+    #[test]
+    fn system_package_manifest_requires_metrics_before_any_sampling() {
+        use among_example_plugins::{managed, system};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (manifest, _) = manifest(&root, "system-status").unwrap();
+        assert_eq!(manifest.required_features, ["status", "system.metrics"]);
+        let profile = managed::Profile {
+            identity: "github:1431055733/system-status",
+            required: &["status", "system.metrics"],
+            optional: &[],
+        };
+        let hello = admission(&manifest);
+        let input = format!("{hello}\n{{\"type\":\"shutdown\"}}\n");
+        let mut output = Vec::new();
+        let mut sampler = system::Sampler::new(system::Linux);
+        managed::serve(&profile, input.as_bytes(), &mut output, |scope, _| {
+            sampler.managed_status(scope, std::time::Duration::ZERO)
+        })
+        .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), hello);
+        for features in [json!(["status"]), json!(["system.metrics"])] {
+            let mut denied = hello.clone();
+            denied["features"] = features;
+            let mut output = Vec::new();
+            assert!(managed::serve(
+                &profile,
+                format!("{denied}\n").as_bytes(),
+                &mut output,
+                |_, _| { panic!("missing required grant reached the sampler") }
+            )
+            .is_err());
+            assert!(output.is_empty());
+        }
     }
 }

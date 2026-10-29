@@ -1,6 +1,7 @@
 name: Locked Rust source checks
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -277,6 +278,18 @@ jobs:
             if "$@" 2> refusal.txt; then echo "accepted: $*"; exit 1; fi
             grep -F "$reason" refusal.txt || { cat refusal.txt; exit 1; }
           }
+          approved=$(sha256sum release/assets/SHA256SUMS | cut -d' ' -f1)
+          (cd release/assets && sha256sum *) > before-prepared.txt
+          "$tool" prepared-inventory release 7 "$revision" v1.0.1 "$approved" publication-inventory.json
+          (cd release/assets && sha256sum *) > after-prepared.txt
+          cmp before-prepared.txt after-prepared.txt
+          jq -e --arg revision "$revision" --arg digest "$approved" \
+            '.tag == "v1.0.1" and .revision == $revision and .inventory_sha256 == $digest' publication-inventory.json
+          cp -R release changed-preparation
+          printf x >> changed-preparation/assets/among-plugins.json
+          refuse 'prepared asset bytes differ' \
+            "$tool" prepared-inventory changed-preparation 7 "$revision" v1.0.1 "$approved" refused-inventory.json
+          test ! -e refused-inventory.json
           refuse 'is not this repository, revision and architecture' \
             "$tool" author-catalogue amd64 arm64 8 v1.0.0 "$revision" other-repository
           refuse 'is not this repository, revision and architecture' \
@@ -299,6 +312,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: ./.github/workflows/plugin-release.yml
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
     with:
       publish: false

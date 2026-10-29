@@ -1,7 +1,7 @@
 # system-status: explicit managed entrypoint, unchanged real sampler
 
 `system-status-managed` is the production managed API 1.2 entrypoint for identity
-`github:1431055733/system-status`. it requires only `status`, selects no optional
+`github:1431055733/system-status`. it requires `status` and `system.metrics`, selects no optional
 features and uses the shared [managed transport](managed-status.md). legacy hello
 and pre-admission status are not fallback admission paths. there is no separate
 legacy executable or protocol loop.
@@ -35,12 +35,16 @@ values. application-footer and defensive wrong-target/slot calls produce no
 fragments and do not sample or advance the clocks. actual pane/workspace requests
 and ungranted context fields are refused by managed transport before the callback.
 no terminal/cwd/settings/notification access is needed or selected.
+Missing either required feature, or a duplicate offered feature, refuses admission
+before sampling. The static manifest and managed entrypoint require the same pair.
 
 these are the **visible aggregate proc view and inherited root mount** of the
 plugin process. in a container, `/proc` may expose host-wide or virtualized
 accounting while `/` names the container mount. the values do not promise host-
 global metrics, per-plugin usage, cgroup entitlement or CPU-quota normalization.
-the host is not a sandbox and this port adds no timezone/environment or OS grants.
+The plugin's handshake does not implement host confinement. The host must enforce
+its sandbox and explicit metrics grant; selecting `system.metrics` does not grant
+general filesystem or environment access.
 
 ## evidence boundaries
 

@@ -639,6 +639,172 @@ fn read_inventory(path: &Path) -> Result<Inventory> {
     )?)?)?)
 }
 
+/// Rebind preparation metadata to the approved tag without rebuilding assets.
+/// The approval digest covers SHA256SUMS, whose canonical bytes cover every
+/// other asset. No output is created until the entire directory agrees.
+pub fn prepared_inventory(
+    prepared: &Path,
+    repository_id: u64,
+    revision: &str,
+    tag: &str,
+    approved_inventory_sha256: &str,
+    output: &Path,
+) -> Result<()> {
+    if repository_id == 0
+        || !package::hex(revision, 40)
+        || !crate::catalogue::tag_name(tag)
+        || !package::hex(approved_inventory_sha256, 64)
+        || !fs::symlink_metadata(prepared)?.is_dir()
+    {
+        return Err("prepared release requires exact repository/source/tag/approval inputs".into());
+    }
+    let mut inventory = read_inventory(&prepared.join("inventory.json"))?;
+    if inventory.repository_id != repository_id
+        || inventory.revision != revision
+        || inventory.inventory_sha256 != approved_inventory_sha256
+        || inventory.assets.is_empty()
+        || inventory.assets.len() > MAX_ASSETS
+    {
+        return Err("prepared inventory differs from the approved source or digest".into());
+    }
+    let assets = prepared.join("assets");
+    if !fs::symlink_metadata(&assets)?.is_dir() {
+        return Err("prepared assets must be a real directory".into());
+    }
+    let mut expected = BTreeMap::new();
+    for asset in &inventory.assets {
+        if asset.name.contains('/')
+            || !archive::relative(&asset.name)
+            || asset.size == 0
+            || asset.size > archive::MAX_FILE
+            || !package::hex(&asset.sha256, 64)
+            || expected.insert(asset.name.as_str(), asset).is_some()
+        {
+            return Err("prepared inventory has invalid or duplicate assets".into());
+        }
+    }
+    let source_name = source_archive_name(revision);
+    for required in [CATALOGUE, SUMS, source_name.as_str()] {
+        if !expected.contains_key(required) {
+            return Err(format!("prepared inventory lacks {required}").into());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for entry in fs::read_dir(&assets)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "non-UTF-8 prepared asset")?;
+        let declaration = expected
+            .get(name.as_str())
+            .ok_or("unrecorded prepared asset")?;
+        let bytes = archive::read(&entry.path(), archive::MAX_FILE)?;
+        if !seen.insert(name)
+            || bytes.len() as u64 != declaration.size
+            || archive::hash(&bytes) != declaration.sha256
+        {
+            return Err("prepared asset bytes differ from the approved inventory".into());
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err("prepared release is missing an approved asset".into());
+    }
+    let sums = archive::read(&assets.join(SUMS), 64 * 1024)?;
+    let canonical = expected
+        .iter()
+        .filter(|(name, _)| **name != SUMS)
+        .map(|(name, asset)| format!("{}  {name}\n", asset.sha256))
+        .collect::<String>();
+    if sums != canonical.as_bytes() || archive::hash(&sums) != approved_inventory_sha256 {
+        return Err("prepared SHA256SUMS differs from the exact owner approval".into());
+    }
+    let catalogue = strict::parse(&archive::read(
+        &assets.join(CATALOGUE),
+        MAX_CATALOGUE as u64,
+    )?)?;
+    let plugins = catalogue["plugins"]
+        .as_array()
+        .filter(|entries| !entries.is_empty() && entries.len() <= MAX_PLUGINS)
+        .ok_or("prepared catalogue lacks bounded plugins")?;
+    if catalogue["schema_version"] != 2 {
+        return Err("prepared catalogue must use schema2".into());
+    }
+    let source = source_record(
+        repository_id,
+        revision,
+        &source_name,
+        &expected[source_name.as_str()].sha256,
+    );
+    let mut referenced = BTreeSet::from([CATALOGUE.to_owned(), SUMS.to_owned(), source_name]);
+    let mut ids = BTreeSet::new();
+    for plugin in plugins {
+        let id = plugin["id"]
+            .as_str()
+            .filter(|id| plugin_id(id))
+            .ok_or("prepared plugin lacks an id")?;
+        let versions = plugin["versions"]
+            .as_array()
+            .filter(|versions| versions.len() == 1)
+            .ok_or("prepared plugin requires exactly one version")?;
+        let version = &versions[0];
+        if !ids.insert(id) || version["revision"] != revision {
+            return Err(
+                "prepared catalogue does not bind unique plugins to the approved source".into(),
+            );
+        }
+        let artifacts = version["artifacts"]
+            .as_array()
+            .filter(|artifacts| artifacts.len() == 2)
+            .ok_or("prepared plugin requires both native architectures")?;
+        let mut architectures = BTreeSet::new();
+        for artifact in artifacts {
+            let name = artifact["asset"]
+                .as_str()
+                .ok_or("prepared package lacks an asset name")?;
+            let asset = expected
+                .get(name)
+                .ok_or("catalogue package is absent from inventory")?;
+            let architecture = artifact["architecture"]
+                .as_str()
+                .ok_or("prepared package lacks architecture")?;
+            if !matches!(architecture, "amd64" | "arm64")
+                || !architectures.insert(architecture)
+                || !referenced.insert(name.to_owned())
+                || artifact["size"] != asset.size
+                || artifact["sha256"] != asset.sha256
+            {
+                return Err("prepared catalogue package differs from the asset inventory".into());
+            }
+            let members: Vec<Member> = serde_json::from_value(artifact["members"].clone())?;
+            let files = archive::unpack(
+                &archive::read(&assets.join(name), archive::MAX_FILE)?,
+                &members,
+            )?;
+            let manifest = files
+                .get("among-plugin.json")
+                .ok_or("prepared package lacks manifest")?;
+            let (plugin_version, _, _) = manifest_fields(manifest, id)?;
+            if name != package_name(id, &plugin_version, architecture)
+                || version["manifest_sha256"] != archive::hash(manifest)
+                || version["manifest"] != strict::parse(manifest)?
+                || files
+                    .get("SOURCE.json")
+                    .map(|bytes| strict::parse(bytes))
+                    .transpose()?
+                    != Some(source.clone())
+            {
+                return Err("prepared package manifest or source binding differs".into());
+            }
+        }
+    }
+    if referenced.len() != expected.len() {
+        return Err("prepared inventory contains assets outside its catalogue".into());
+    }
+    inventory.tag = tag.into();
+    archive::json(output, &inventory)
+}
+
 fn body_binding(release: &Value) -> Result<Binding> {
     let body = release["body"].as_str().unwrap_or_default();
     let mut lines = body
@@ -1454,6 +1620,293 @@ mod build_tests {
         assert_eq!(sums.lines().count(), 6);
         assert!(!sums.contains(SUMS));
         assert_eq!(inventory.inventory_sha256, archive::hash(sums.as_bytes()));
+    }
+
+    fn prepared(root: &Path) -> PathBuf {
+        let amd64 = build(root, "amd64", &plugins());
+        let arm64 = build(root, "arm64", &plugins());
+        let output = root.join("prepared");
+        catalogue_with(&amd64, &arm64, 7, "check", REVISION, &output, accept).unwrap();
+        output
+    }
+
+    fn edit_inventory(prepared: &Path, edit: impl Fn(&mut Value)) {
+        let path = prepared.join("inventory.json");
+        let mut value = strict::parse(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut value);
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn prepared_inventory_retags_metadata_without_changing_approved_bytes() {
+        let root = Scratch::new("prepared-ok");
+        let prepared = prepared(&root.0);
+        let inventory_before = fs::read(prepared.join("inventory.json")).unwrap();
+        let inventory = read_inventory(&prepared.join("inventory.json")).unwrap();
+        let before = inventory
+            .assets
+            .iter()
+            .map(|asset| {
+                (
+                    asset.name.clone(),
+                    fs::read(prepared.join("assets").join(&asset.name)).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let output = root.0.join("publication.json");
+        prepared_inventory(
+            &prepared,
+            7,
+            REVISION,
+            "v1.0.0",
+            &inventory.inventory_sha256,
+            &output,
+        )
+        .unwrap();
+        let after = read_inventory(&output).unwrap();
+        assert_eq!(after.tag, "v1.0.0");
+        assert_eq!(after.repository_id, 7);
+        assert_eq!(after.revision, REVISION);
+        assert_eq!(after.inventory_sha256, inventory.inventory_sha256);
+        assert_eq!(
+            serde_json::to_value(&after.assets).unwrap(),
+            serde_json::to_value(&inventory.assets).unwrap()
+        );
+        assert_eq!(
+            fs::read(prepared.join("inventory.json")).unwrap(),
+            inventory_before
+        );
+        for (name, bytes) in before {
+            assert_eq!(fs::read(prepared.join("assets").join(name)).unwrap(), bytes);
+        }
+        assert!(prepared_inventory(
+            &prepared,
+            7,
+            REVISION,
+            "v1.0.0",
+            &inventory.inventory_sha256,
+            &output
+        )
+        .is_err());
+        assert_eq!(read_inventory(&output).unwrap().tag, "v1.0.0");
+    }
+
+    #[test]
+    fn prepared_inventory_refuses_damage_before_creating_output() {
+        type Damage = fn(&Path);
+        let cases: &[(&str, Damage)] = &[
+            ("changed asset", |root| {
+                fs::write(
+                    root.join("assets/alpha-1.0.0-linux-amd64.tar.gz"),
+                    b"changed",
+                )
+                .unwrap();
+            }),
+            ("missing asset", |root| {
+                fs::remove_file(root.join("assets/alpha-1.0.0-linux-amd64.tar.gz")).unwrap();
+            }),
+            ("extra asset", |root| {
+                fs::write(root.join("assets/unreviewed"), b"extra").unwrap();
+            }),
+            ("asset directory", |root| {
+                fs::create_dir(root.join("assets/unreviewed")).unwrap();
+            }),
+            ("asset symlink", |root| {
+                let path = root.join("assets/alpha-1.0.0-linux-amd64.tar.gz");
+                let target = root.join("outside");
+                fs::rename(&path, &target).unwrap();
+                std::os::unix::fs::symlink(target, path).unwrap();
+            }),
+            ("assets symlink", |root| {
+                fs::rename(root.join("assets"), root.join("outside")).unwrap();
+                std::os::unix::fs::symlink("outside", root.join("assets")).unwrap();
+            }),
+            ("inventory symlink", |root| {
+                fs::rename(root.join("inventory.json"), root.join("outside.json")).unwrap();
+                std::os::unix::fs::symlink("outside.json", root.join("inventory.json")).unwrap();
+            }),
+            ("duplicate asset", |root| {
+                edit_inventory(root, |value| {
+                    let first = value["assets"][0].clone();
+                    value["assets"].as_array_mut().unwrap().push(first);
+                })
+            }),
+            ("path traversal", |root| {
+                edit_inventory(root, |value| {
+                    value["assets"][0]["name"] = "../outside".into()
+                })
+            }),
+            ("empty inventory", |root| {
+                edit_inventory(root, |value| value["assets"] = json!([]))
+            }),
+            ("65 assets", |root| {
+                edit_inventory(root, |value| {
+                    value["assets"] = Value::Array(vec![value["assets"][0].clone(); 65])
+                })
+            }),
+            ("wrong size", |root| {
+                edit_inventory(root, |value| value["assets"][0]["size"] = 1.into())
+            }),
+            ("zero size", |root| {
+                edit_inventory(root, |value| value["assets"][0]["size"] = 0.into())
+            }),
+            ("oversize", |root| {
+                edit_inventory(root, |value| {
+                    value["assets"][0]["size"] = (archive::MAX_FILE + 1).into()
+                })
+            }),
+            ("malformed digest", |root| {
+                edit_inventory(root, |value| {
+                    value["assets"][0]["sha256"] = "A".repeat(64).into()
+                })
+            }),
+            ("wrong repository", |root| {
+                edit_inventory(root, |value| value["repository_id"] = 8.into())
+            }),
+            ("wrong revision", |root| {
+                edit_inventory(root, |value| value["revision"] = "a".repeat(40).into())
+            }),
+            ("changed sums", |root| {
+                let path = root.join("assets").join(SUMS);
+                let text = fs::read_to_string(&path).unwrap();
+                fs::write(path, text.lines().rev().collect::<Vec<_>>().join("\n")).unwrap();
+            }),
+            ("duplicate inventory key", |root| {
+                let path = root.join("inventory.json");
+                let text = fs::read_to_string(&path).unwrap();
+                fs::write(path, text.replacen('{', "{\"repository_id\":7,", 1)).unwrap();
+            }),
+        ];
+        for (name, damage) in cases {
+            let root = Scratch::new("prepared-damage");
+            let prepared = prepared(&root.0);
+            let digest = read_inventory(&prepared.join("inventory.json"))
+                .unwrap()
+                .inventory_sha256;
+            damage(&prepared);
+            let output = root.0.join("publication.json");
+            assert!(
+                prepared_inventory(&prepared, 7, REVISION, "v1.0.0", &digest, &output).is_err(),
+                "{name}"
+            );
+            assert!(!output.exists(), "{name} created output");
+        }
+    }
+
+    #[test]
+    fn prepared_inventory_requires_exact_approval_and_source_even_with_valid_assets() {
+        let root = Scratch::new("prepared-inputs");
+        let prepared = prepared(&root.0);
+        let digest = read_inventory(&prepared.join("inventory.json"))
+            .unwrap()
+            .inventory_sha256;
+        let output = root.0.join("publication.json");
+        for (repository, revision, tag, approval) in [
+            (0, REVISION, "v1.0.0", digest.as_str()),
+            (8, REVISION, "v1.0.0", digest.as_str()),
+            (7, "short", "v1.0.0", digest.as_str()),
+            (7, REVISION, "v 1", digest.as_str()),
+            (7, REVISION, "v1.0.0", "bad"),
+            (7, REVISION, "v1.0.0", &"a".repeat(64)),
+        ] {
+            assert!(
+                prepared_inventory(&prepared, repository, revision, tag, approval, &output)
+                    .is_err()
+            );
+            assert!(!output.exists());
+        }
+        // Rewriting unapproved metadata cannot reassign the approved packages.
+        edit_inventory(&prepared, |value| value["repository_id"] = 8.into());
+        let error =
+            prepared_inventory(&prepared, 8, REVISION, "v1.0.0", &digest, &output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manifest or source binding differs"),
+            "{error}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn approved_checksums_do_not_replace_catalogue_binding_checks() {
+        type Damage = fn(&mut Value);
+        let cases: &[(&str, Damage)] = &[
+            ("schema1", |value| value["schema_version"] = 1.into()),
+            ("empty plugins", |value| value["plugins"] = json!([])),
+            ("wrong revision", |value| {
+                value["plugins"][0]["versions"][0]["revision"] = "a".repeat(40).into()
+            }),
+            ("two versions", |value| {
+                let version = value["plugins"][0]["versions"][0].clone();
+                value["plugins"][0]["versions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(version);
+            }),
+            ("unlisted asset", |value| {
+                value["plugins"][0]["versions"][0]["artifacts"][0]["asset"] = "absent.tar.gz".into()
+            }),
+            ("wrong size", |value| {
+                value["plugins"][0]["versions"][0]["artifacts"][0]["size"] = 1.into()
+            }),
+            ("wrong digest", |value| {
+                value["plugins"][0]["versions"][0]["artifacts"][0]["sha256"] = "a".repeat(64).into()
+            }),
+            ("wrong manifest", |value| {
+                value["plugins"][0]["versions"][0]["manifest"]["description"] = "changed".into()
+            }),
+            ("missing architecture", |value| {
+                value["plugins"][0]["versions"][0]["artifacts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }),
+            ("unreferenced packages", |value| {
+                value["plugins"].as_array_mut().unwrap().pop();
+            }),
+        ];
+        for (name, damage) in cases {
+            let root = Scratch::new("prepared-catalogue");
+            let prepared = prepared(&root.0);
+            let path = prepared.join("assets").join(CATALOGUE);
+            let mut value = strict::parse(&fs::read(&path).unwrap()).unwrap();
+            damage(&mut value);
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let mut inventory = read_inventory(&prepared.join("inventory.json")).unwrap();
+            for asset in &mut inventory.assets {
+                let bytes = fs::read(prepared.join("assets").join(&asset.name)).unwrap();
+                asset.size = bytes.len() as u64;
+                asset.sha256 = archive::hash(&bytes);
+            }
+            let sums = inventory
+                .assets
+                .iter()
+                .filter(|asset| asset.name != SUMS)
+                .map(|asset| format!("{}  {}\n", asset.sha256, asset.name))
+                .collect::<String>();
+            fs::write(prepared.join("assets").join(SUMS), &sums).unwrap();
+            let digest = archive::hash(sums.as_bytes());
+            let asset = inventory
+                .assets
+                .iter_mut()
+                .find(|asset| asset.name == SUMS)
+                .unwrap();
+            asset.size = sums.len() as u64;
+            asset.sha256 = digest.clone();
+            inventory.inventory_sha256 = digest.clone();
+            fs::write(
+                prepared.join("inventory.json"),
+                serde_json::to_vec(&inventory).unwrap(),
+            )
+            .unwrap();
+            let output = root.0.join("publication.json");
+            assert!(
+                prepared_inventory(&prepared, 7, REVISION, "v1.0.0", &digest, &output).is_err(),
+                "{name}"
+            );
+            assert!(!output.exists(), "{name} created output");
+        }
     }
 
     #[test]

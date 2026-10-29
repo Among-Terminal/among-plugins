@@ -5,7 +5,7 @@ fn main() -> std::process::ExitCode {
     let mut sampler = system::Sampler::new(system::Linux);
     let profile = managed::Profile {
         identity: "github:1431055733/system-status",
-        required: &["status"],
+        required: &["status", "system.metrics"],
         optional: &[],
     };
     managed::run(&profile, move |scope, _| {

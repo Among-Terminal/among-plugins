@@ -16,7 +16,7 @@ const TIPS: [&str; 3] = [
 fn hello() -> Value {
     json!({"type":"managed_hello","major":1,"minor":2,
         "identity":"github:1431055733/system-status","session":"resource-session",
-        "generation":"resource-generation","features":["status"]})
+        "generation":"resource-generation","features":["status","system.metrics"]})
 }
 
 fn request(id: u64, slot: &str) -> Value {
@@ -186,14 +186,20 @@ fn percentage(row: &Value, index: usize) -> u8 {
 }
 
 #[test]
-fn managed_system_admits_only_status_preserves_binding_and_stops() {
+fn managed_system_requires_metrics_preserves_binding_and_stops() {
     let mut process = Process::start();
     assert!(matches!(
         process.output.recv_timeout(Duration::from_millis(30)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     let mut greeting = hello();
-    greeting["features"] = json!(["status", "settings", "context.terminals", "context.cwd"]);
+    greeting["features"] = json!([
+        "status",
+        "system.metrics",
+        "settings",
+        "context.terminals",
+        "context.cwd"
+    ]);
     process.send(greeting);
     assert_eq!(process.receive(), hello());
     let first = process.header(1);
@@ -231,7 +237,13 @@ fn managed_system_refuses_bad_admission_and_ungranted_targets() {
         ("major", json!(2)),
         ("minor", json!(0)),
         ("features", json!([])),
+        ("features", json!(["status"])),
+        ("features", json!(["system.metrics"])),
         ("features", json!(["status", "status"])),
+        (
+            "features",
+            json!(["status", "system.metrics", "system.metrics"]),
+        ),
     ] {
         let mut greeting = hello();
         greeting[field] = value;
