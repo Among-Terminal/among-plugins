@@ -239,8 +239,9 @@ fn source_record(repository_id: u64, revision: &str, archive: &str, sha256: &str
 /// by every host. The answer is judged by the host's own admission rule: the
 /// first `managed_hello` must repeat version, identity, session and generation,
 /// and its features must be offered and include every required one. Feature
-/// order and fields the host ignores do not matter, and other well-formed
-/// frames before the admission carry no authority, as in the host.
+/// order and fields the host ignores do not matter, and other frames before
+/// the admission, including lines that are not JSON, are discarded as the
+/// host discards them.
 fn admission(binary: &Path, repository_id: u64, id: &str, manifest: &[u8]) -> Result<()> {
     let manifest = strict::parse(manifest)?;
     let required = manifest["required_features"]
@@ -263,8 +264,9 @@ fn admission(binary: &Path, repository_id: u64, id: &str, manifest: &[u8]) -> Re
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        let frame: Value = serde_json::from_slice(line)
-            .map_err(|_| format!("{id}: entrypoint wrote a line that is not JSON"))?;
+        let Ok(frame) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
         if frame["type"] == "managed_hello" {
             answer = Some(frame);
             break;
@@ -2686,7 +2688,7 @@ mod admission_tests {
             ),
             (
                 "preceded",
-                format!("read line; printf '%s\\n' '{{\"type\":\"log\"}}' '{ANSWER},\"features\":[\"status\",\"system.metrics\"]}}'"),
+                format!("read line; printf '%s\\n' 'starting' '{{\"type\":\"log\"}}' '{ANSWER},\"features\":[\"status\",\"system.metrics\"]}}'"),
             ),
         ] {
             let path = entrypoints.script(name, &body);

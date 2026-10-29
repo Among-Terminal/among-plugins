@@ -20,11 +20,11 @@ on:
       prepared-sha256sums:
         description: Approved SHA256 of SHA256SUMS.
         type: string
+        default: ''
       prerelease:
         description: Publish the approved bytes as a prerelease (a tag with a hyphen, such as v0.2.0-rc.1) for development-mode testing.
         type: boolean
         default: false
-        default: ''
 
 permissions:
   contents: read

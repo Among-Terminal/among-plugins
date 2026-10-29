@@ -87,7 +87,9 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/regressed.log"
-          grep -F 'system-status: entrypoint refused admission' "$RUNNER_TEMP/regressed.log"
+          # The real SDK exits on a refused admission, so packaging reports the
+          # failed check rather than a mismatched answer; either names it.
+          grep -E '^system-status: entrypoint (admission check failed|refused admission)' "$RUNNER_TEMP/regressed.log"
       - name: Delivered source builds offline without the original checkout or registry
         run: |
           set -euo pipefail

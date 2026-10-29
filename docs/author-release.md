@@ -105,6 +105,9 @@ on:
       prerelease: {type: boolean, default: false}
 permissions:
   contents: read
+concurrency:
+  group: plugin-release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   prepare:
     if: ${{ !inputs.publish }}
