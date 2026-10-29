@@ -19,9 +19,18 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools author-packages <source-root> <native-binary-directory> <vendor-directory> <repository-id> <new-output>
        among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output>
        among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
+       among-tools prepared-run <run.json> <artifact.json> <repository-id> <source> <run-id> <artifact-id> <workflow-ref>
        among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
-       among-tools verify-release resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
+       among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
        among-tools resolve-tag <repository-id> <tag>";
+
+fn channel(name: &str) -> Result<author::Channel> {
+    match name {
+        "stable" => Ok(author::Channel::Stable),
+        "prerelease" => Ok(author::Channel::Prerelease),
+        _ => Err(USAGE.into()),
+    }
+}
 
 fn stage(name: &str) -> Result<author::Stage> {
     match name {
@@ -84,6 +93,19 @@ fn run() -> Result<()> {
                 Path::new(output),
             )
         }
+        [command, run, artifact, repository, source, run_id, artifact_id, workflow]
+            if command == "prepared-run" =>
+        {
+            author::prepared_run(
+                Path::new(run),
+                Path::new(artifact),
+                repository.parse()?,
+                source,
+                run_id.parse()?,
+                artifact_id.parse()?,
+                workflow,
+            )
+        }
         [command, prepared, repository, revision, tag, digest, output]
             if command == "prepared-inventory" =>
         {
@@ -96,10 +118,11 @@ fn run() -> Result<()> {
                 Path::new(output),
             )
         }
-        [command, name, release, inventory, binding, rest @ ..]
+        [command, kind, name, release, inventory, binding, rest @ ..]
             if command == "verify-release" && rest.len() <= 1 =>
         {
             let missing = author::verify_release(
+                channel(kind)?,
                 stage(name)?,
                 Path::new(release),
                 Path::new(inventory),

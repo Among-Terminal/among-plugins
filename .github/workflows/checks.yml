@@ -69,6 +69,27 @@ jobs:
           cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > dist/vendor-config.toml
           tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$PWD/dist/${{ matrix.architecture }}"
           (cd "dist/${{ matrix.architecture }}" && sha256sum -c SHA256SUMS)
+      - name: A manifest without system.metrics is not packaged for the real binary
+        run: |
+          set -euo pipefail
+          # The real system-status executable requires system.metrics. With a
+          # manifest that no longer declares it, schema 2 packaging must stop
+          # at the admission check instead of producing a package hosts refuse.
+          regressed="$RUNNER_TEMP/regressed-manifest"
+          git clone -q --no-hardlinks "$PWD" "$regressed"
+          manifest="$regressed/plugins/system-status/among-plugin.json"
+          jq '.required_features = ["status"]' "$manifest" > "$manifest.new"
+          mv "$manifest.new" "$manifest"
+          git -C "$regressed" -c user.name=check -c user.email=check@invalid commit -q -am regressed
+          if tools/among-tools/target/debug/among-tools author-packages "$regressed" "$PWD/target/release" \
+              "$PWD/vendor" 1431055733 "$RUNNER_TEMP/regressed-out" 2> "$RUNNER_TEMP/regressed.log"; then
+            echo "a manifest without system.metrics was packaged" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/regressed.log"
+          # The real SDK exits on a refused admission, so packaging reports the
+          # failed check rather than a mismatched answer; either names it.
+          grep -E '^system-status: entrypoint (admission check failed|refused admission)' "$RUNNER_TEMP/regressed.log"
       - name: Delivered source builds offline without the original checkout or registry
         run: |
           set -euo pipefail
@@ -312,6 +333,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: false

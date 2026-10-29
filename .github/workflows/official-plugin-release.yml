@@ -21,6 +21,10 @@ on:
         description: Approved SHA256 of SHA256SUMS.
         type: string
         default: ''
+      prerelease:
+        description: Publish the approved bytes as a prerelease (a tag with a hyphen, such as v0.2.0-rc.1) for development-mode testing.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,7 +36,7 @@ concurrency:
 jobs:
   prepare:
     if: ${{ !inputs.publish }}
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: false
 
@@ -46,6 +50,7 @@ jobs:
           REF: ${{ github.ref }}
           PREPARED_RUN: ${{ inputs.prepared-run-id }}
           PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
+          PRERELEASE: ${{ inputs.prerelease }}
           PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
         run: |
           set -euo pipefail
@@ -53,6 +58,12 @@ jobs:
           printf '%s' "$PREPARED_RUN" | grep -Eqx '[1-9][0-9]{0,19}'
           printf '%s' "$PREPARED_ARTIFACT" | grep -Eqx '[1-9][0-9]{0,19}'
           printf '%s' "$PREPARED_DIGEST" | grep -Eqx '[0-9a-f]{64}'
+          # A release candidate tag carries a hyphen and is published only as a
+          # prerelease; a stable tag never is.
+          case "$REF" in
+            refs/tags/v*-*) test "$PRERELEASE" = true ;;
+            *) test "$PRERELEASE" = false ;;
+          esac
 
   publish:
     if: ${{ inputs.publish }}
@@ -60,9 +71,10 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@1475e62de6a9640f25a29d6f6b4d7f201a4bd015
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
     with:
       publish: true
       prepared-run-id: ${{ inputs.prepared-run-id }}
       prepared-artifact-id: ${{ inputs.prepared-artifact-id }}
       prepared-sha256sums: ${{ inputs.prepared-sha256sums }}
+      prerelease: ${{ inputs.prerelease }}

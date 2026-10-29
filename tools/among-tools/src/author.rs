@@ -10,13 +10,14 @@
 use crate::{
     archive::{self, Member},
     package::{self, Delivery, Runtime},
-    strict, toolchain, Result,
+    process, strict, toolchain, Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const AUTHOR: Delivery<'static> = Delivery {
     legal_required: &["LICENSE"],
@@ -232,6 +233,70 @@ fn source_record(repository_id: u64, revision: &str, archive: &str, sha256: &str
     json!({"repository_id":repository_id,"revision":revision,"source_archive":archive,"source_sha256":sha256})
 }
 
+/// Starts the built entrypoint once and offers it exactly the manifest's
+/// `required_features`, as the host does on enable. A manifest that lost a
+/// feature the executable needs would otherwise be packaged and then refused
+/// by every host. The answer is judged by the host's own admission rule: the
+/// first `managed_hello` must repeat version, identity, session and generation,
+/// and its features must be offered and include every required one. Feature
+/// order and fields the host ignores do not matter, and other frames before
+/// the admission, including lines that are not JSON, are discarded as the
+/// host discards them.
+fn admission(binary: &Path, repository_id: u64, id: &str, manifest: &[u8]) -> Result<()> {
+    let manifest = strict::parse(manifest)?;
+    let required = manifest["required_features"]
+        .as_array()
+        .filter(|features| features.iter().all(Value::is_string))
+        .ok_or(format!(
+            "{id}: manifest required_features is not a list of names"
+        ))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let identity = format!("github:{repository_id}/{id}");
+    let hello = json!({"type":"managed_hello","major":1,"minor":2,"identity":identity,
+        "session":"package-check","generation":"package-check","features":required});
+    let input = format!("{hello}\n{{\"type\":\"shutdown\"}}\n");
+    let output = process::capture(&mut Command::new(binary), input.as_bytes(), 64 * 1024)
+        .map_err(|error| format!("{id}: entrypoint admission check failed: {error}"))?;
+    let mut answer = None;
+    for line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(frame) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if frame["type"] == "managed_hello" {
+            answer = Some(frame);
+            break;
+        }
+    }
+    let answer = answer.ok_or(format!("{id}: entrypoint did not answer the admission"))?;
+    let features = answer["features"]
+        .as_array()
+        .filter(|features| features.iter().all(Value::is_string))
+        .map(|features| {
+            features
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        });
+    if answer["major"] != 1
+        || answer["minor"] != 2
+        || answer["identity"] != identity
+        || answer["session"] != "package-check"
+        || answer["generation"] != "package-check"
+        || features.as_ref() != Some(&required)
+    {
+        return Err(format!(
+            "{id}: entrypoint refused admission with exactly its manifest required_features {required:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// `author-packages`: native packages of every declared plugin plus the
 /// source and licence delivery, for this machine's architecture.
 pub fn packages(
@@ -268,6 +333,7 @@ pub fn packages(
     for plugin in plugins {
         let binary = binaries.join(plugin.entrypoint.rsplit('/').next().unwrap_or_default());
         let (runtime, needed_libraries) = package::native(&binary, &architecture)?;
+        admission(&binary, repository_id, &plugin.id, &plugin.manifest)?;
         let mut files = legal.clone();
         files.extend(rust.common.clone());
         files.extend(rust.native.clone());
@@ -639,6 +705,59 @@ fn read_inventory(path: &Path) -> Result<Inventory> {
     )?)?)?)
 }
 
+/// Accepts the GitHub run and artifact records of an approved preparation.
+/// Any successful run of the same commit can upload a candidate under the
+/// same name, and rebuilt packages differ byte for byte, so only a manual
+/// run of the workflow that is now publishing, in this repository, counts.
+#[allow(clippy::too_many_arguments)]
+pub fn prepared_run(
+    run: &Path,
+    artifact: &Path,
+    repository_id: u64,
+    source: &str,
+    run_id: u64,
+    artifact_id: u64,
+    workflow_ref: &str,
+) -> Result<()> {
+    let caller = workflow_ref
+        .splitn(3, '/')
+        .nth(2)
+        .and_then(|rest| rest.split_once('@'))
+        .map(|(path, _)| path)
+        .filter(|path| {
+            path.starts_with(".github/workflows/")
+                && (path.ends_with(".yml") || path.ends_with(".yaml"))
+        })
+        .ok_or("publishing workflow reference has no workflow path")?;
+    if repository_id == 0 || run_id == 0 || artifact_id == 0 || !package::hex(source, 40) {
+        return Err("prepared run requires exact repository/source/run/artifact inputs".into());
+    }
+    let run = strict::parse(&archive::read(run, 1024 * 1024)?)?;
+    let artifact = strict::parse(&archive::read(artifact, 1024 * 1024)?)?;
+    if run["id"] != run_id
+        || run["repository"]["id"] != repository_id
+        || run["head_repository"]["id"] != repository_id
+        || run["event"] != "workflow_dispatch"
+        || run["path"] != caller
+        || run["head_sha"] != source
+        || run["status"] != "completed"
+        || run["conclusion"] != "success"
+    {
+        return Err(
+            "prepared run is not a successful manual run of this workflow and source".into(),
+        );
+    }
+    if artifact["id"] != artifact_id
+        || artifact["workflow_run"]["id"] != run_id
+        || artifact["workflow_run"]["head_sha"] != source
+        || artifact["expired"] != false
+        || artifact["name"] != format!("plugin-release-candidate-{source}")
+    {
+        return Err("prepared artifact is not the unexpired candidate of that run".into());
+    }
+    Ok(())
+}
+
 /// Rebind preparation metadata to the approved tag without rebuilding assets.
 /// The approval digest covers SHA256SUMS, whose canonical bytes cover every
 /// other asset. No output is created until the entire directory agrees.
@@ -827,10 +946,21 @@ pub enum Stage {
     Published,
 }
 
+/// Which kind of release a run publishes. A prerelease is what development
+/// mode installs for testing; it is never the repository's latest release,
+/// and a later stable release of the same version replaces nothing in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Stable,
+    Prerelease,
+}
+
 /// `verify-release`: compares a release, as the REST API returns it, with
 /// the expected inventory and binding. For `Resume` it returns the names of
-/// assets still to upload; otherwise an empty list.
+/// assets still to upload; otherwise an empty list. A published stable
+/// release must be the latest one; a published prerelease must not be.
 pub fn verify_release(
+    channel: Channel,
     stage: Stage,
     release: &Path,
     inventory: &Path,
@@ -858,7 +988,7 @@ pub fn verify_release(
     let draft = stage != Stage::Published;
     if release["tag_name"] != inventory.tag.as_str()
         || release["draft"] != draft
-        || release["prerelease"] != false
+        || release["prerelease"] != (channel == Channel::Prerelease)
     {
         return Err(format!(
             "release {id} is not the {} release of {}",
@@ -920,16 +1050,28 @@ pub fn verify_release(
             )
             .into());
         }
-        let latest = strict::parse(&archive::read(
-            latest.ok_or("published check needs the latest release")?,
-            4 * 1024 * 1024,
-        )?)?;
-        if latest["id"] != id {
-            return Err(format!(
-                "latest release is {}, not the published release {id}",
-                latest["id"]
-            )
-            .into());
+        // Before the first stable release `releases/latest` does not exist,
+        // so a prerelease check accepts an absent latest record.
+        match (channel, latest) {
+            (Channel::Stable, None) => {
+                return Err("published check needs the latest release".into())
+            }
+            (_, Some(latest)) => {
+                let latest = strict::parse(&archive::read(latest, 4 * 1024 * 1024)?)?;
+                if (latest["id"] == id) != (channel == Channel::Stable) {
+                    return Err(format!(
+                        "latest release is {}; the published {} release is {id}",
+                        latest["id"],
+                        if channel == Channel::Stable {
+                            "stable"
+                        } else {
+                            "pre-"
+                        }
+                    )
+                    .into());
+                }
+            }
+            (Channel::Prerelease, None) => {}
         }
     }
     Ok(Vec::new())
@@ -1238,7 +1380,15 @@ mod tests {
         let package = asset("a-1.0.0-linux-amd64.tar.gz", 10, &"d".repeat(64));
         let ours = release(&scratch.0, &line, true, json!([package.clone()]), false);
         assert_eq!(
-            verify_release(Stage::Resume, &ours, &inventory, &binding, None).unwrap(),
+            verify_release(
+                Channel::Stable,
+                Stage::Resume,
+                &ours,
+                &inventory,
+                &binding,
+                None
+            )
+            .unwrap(),
             vec![SUMS.to_owned()]
         );
         let other_run = line.replace("\"run_id\":99", "\"run_id\":98");
@@ -1357,14 +1507,73 @@ mod tests {
             ),
         ];
         for (name, path, reason) in cases {
-            let error = verify_release(Stage::Resume, &path, &inventory, &binding, None)
-                .err()
-                .map(|error| error.to_string());
+            let error = verify_release(
+                Channel::Stable,
+                Stage::Resume,
+                &path,
+                &inventory,
+                &binding,
+                None,
+            )
+            .err()
+            .map(|error| error.to_string());
             assert!(
                 error.as_deref().is_some_and(|error| error.contains(reason)),
                 "{name}: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_prerelease_is_checked_as_one_and_never_as_the_latest_release() {
+        let scratch = Scratch::new("prerelease");
+        let (inventory, binding) = inventory_fixture(&scratch.0);
+        let line = fs::read_to_string(&binding).unwrap();
+        let all = json!([
+            asset("a-1.0.0-linux-amd64.tar.gz", 10, &"d".repeat(64)),
+            asset(SUMS, 5, &"e".repeat(64))
+        ]);
+        let as_prerelease = |path: PathBuf| {
+            let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["prerelease"] = json!(true);
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            path
+        };
+        let draft = as_prerelease(release(&scratch.0, &line, true, all.clone(), false));
+        let published = as_prerelease(release(&scratch.0, &line, false, all.clone(), true));
+        let stable = release(&scratch.0, &line, false, all, true);
+        let check = |channel, stage, release: &Path, latest: Option<&Path>| {
+            verify_release(channel, stage, release, &inventory, &binding, latest)
+        };
+        assert!(check(Channel::Prerelease, Stage::Draft, &draft, None).is_ok());
+        assert!(check(Channel::Stable, Stage::Draft, &draft, None).is_err());
+        // Before the first stable release there is no latest record at all.
+        assert!(check(Channel::Prerelease, Stage::Published, &published, None).is_ok());
+        let latest = scratch.0.join("latest.json");
+        fs::write(&latest, br#"{"id":40}"#).unwrap();
+        assert!(check(
+            Channel::Prerelease,
+            Stage::Published,
+            &published,
+            Some(&latest)
+        )
+        .is_ok());
+        fs::write(&latest, br#"{"id":41}"#).unwrap();
+        assert!(check(
+            Channel::Prerelease,
+            Stage::Published,
+            &published,
+            Some(&latest)
+        )
+        .is_err());
+        assert!(check(
+            Channel::Prerelease,
+            Stage::Published,
+            &stable,
+            Some(&latest)
+        )
+        .is_err());
+        assert!(check(Channel::Stable, Stage::Published, &stable, None).is_err());
     }
 
     #[test]
@@ -1377,11 +1586,16 @@ mod tests {
             asset(SUMS, 5, &"e".repeat(64))
         ]);
         let draft = release(&scratch.0, &line, true, all.clone(), false);
-        assert!(
-            verify_release(Stage::Draft, &draft, &inventory, &binding, None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(verify_release(
+            Channel::Stable,
+            Stage::Draft,
+            &draft,
+            &inventory,
+            &binding,
+            None
+        )
+        .unwrap()
+        .is_empty());
         let partial = release(
             &scratch.0,
             &line,
@@ -1389,16 +1603,22 @@ mod tests {
             json!([asset(SUMS, 5, &"e".repeat(64))]),
             false,
         );
-        assert!(
-            verify_release(Stage::Draft, &partial, &inventory, &binding, None)
-                .unwrap_err()
-                .to_string()
-                .contains("lacks assets: a-1.0.0-linux-amd64.tar.gz")
-        );
+        assert!(verify_release(
+            Channel::Stable,
+            Stage::Draft,
+            &partial,
+            &inventory,
+            &binding,
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("lacks assets: a-1.0.0-linux-amd64.tar.gz"));
         let latest = scratch.0.join("latest.json");
         fs::write(&latest, br#"{"id":41}"#).unwrap();
         let published = release(&scratch.0, &line, false, all.clone(), true);
         assert!(verify_release(
+            Channel::Stable,
             Stage::Published,
             &published,
             &inventory,
@@ -1408,6 +1628,7 @@ mod tests {
         .is_ok());
         let mutable = release(&scratch.0, &line, false, all, false);
         let error = verify_release(
+            Channel::Stable,
             Stage::Published,
             &mutable,
             &inventory,
@@ -1422,6 +1643,7 @@ mod tests {
         );
         fs::write(&latest, br#"{"id":40}"#).unwrap();
         assert!(verify_release(
+            Channel::Stable,
             Stage::Published,
             &published,
             &inventory,
@@ -2232,9 +2454,16 @@ mod binding_tests {
             .unwrap(),
         )
         .unwrap();
-        let error = verify_release(Stage::Resume, &release, &inventory, &other, None)
-            .unwrap_err()
-            .to_string();
+        let error = verify_release(
+            Channel::Stable,
+            Stage::Resume,
+            &release,
+            &inventory,
+            &other,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("binding and inventory describe different releases"),
             "{error}"
@@ -2298,5 +2527,202 @@ mod host_example_tests {
         assert_eq!(parsed["settings"]["fields"][2]["default"], 0.8);
         assert_eq!(parsed["settings"]["fields"].as_array().unwrap().len(), 6);
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod prepared_run_tests {
+    use super::*;
+
+    // Real records of two successful runs of a9a3b6b0 that both uploaded a
+    // candidate under the same name, with different package bytes: the manual
+    // official preparation and the push run of checks.yml.
+    const SOURCE: &str = "a9a3b6b041ffae4576015a282954edf1571c8b8f";
+    const REPOSITORY: u64 = 1431055733;
+    const CALLER: &str = "Among-Terminal/among-plugins/.github/workflows/official-plugin-release.yml@refs/tags/v0.2.0";
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/prepared-run")
+            .join(name)
+    }
+
+    /// A named change to the accepted run record that must be refused.
+    type Mutation = (&'static str, fn(&mut Value));
+
+    fn check(
+        run: &Path,
+        artifact: &Path,
+        run_id: u64,
+        artifact_id: u64,
+        caller: &str,
+    ) -> Result<()> {
+        prepared_run(
+            run,
+            artifact,
+            REPOSITORY,
+            SOURCE,
+            run_id,
+            artifact_id,
+            caller,
+        )
+    }
+
+    #[test]
+    fn the_manual_run_of_the_publishing_workflow_is_accepted() {
+        check(
+            &fixture("run-dispatch.json"),
+            &fixture("artifact-dispatch.json"),
+            40950110460,
+            12930547627,
+            CALLER,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_push_run_candidate_of_the_same_commit_is_refused() {
+        let error = check(
+            &fixture("run-push.json"),
+            &fixture("artifact-push.json"),
+            40950027131,
+            12930782336,
+            CALLER,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("manual run"), "{error}");
+    }
+
+    #[test]
+    fn another_workflow_repository_or_artifact_of_the_run_is_refused() {
+        let directory = std::env::temp_dir().join(format!("prepared-run-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let run: Value = strict::parse(&fs::read(fixture("run-dispatch.json")).unwrap()).unwrap();
+        let mutations: [Mutation; 4] = [
+            ("fork", |run| run["head_repository"]["id"] = json!(1)),
+            ("event", |run| run["event"] = json!("pull_request")),
+            ("path", |run| {
+                run["path"] = json!(".github/workflows/checks.yml")
+            }),
+            ("failed", |run| run["conclusion"] = json!("failure")),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = run.clone();
+            mutate(&mut changed);
+            let path = directory.join(format!("{name}.json"));
+            fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                check(
+                    &path,
+                    &fixture("artifact-dispatch.json"),
+                    40950110460,
+                    12930547627,
+                    CALLER
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        assert!(check(
+            &fixture("run-dispatch.json"),
+            &fixture("artifact-push.json"),
+            40950110460,
+            12930782336,
+            CALLER,
+        )
+        .is_err());
+        assert!(check(
+            &fixture("run-dispatch.json"),
+            &fixture("artifact-dispatch.json"),
+            40950110460,
+            12930547627,
+            "Among-Terminal/among-plugins/.github/workflows/checks.yml@refs/heads/main",
+        )
+        .is_err());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Stand-in entrypoints written as shell scripts in a directory removed
+    // when the test ends: some answer as the host would admit, some do not.
+    struct Entrypoints(PathBuf);
+
+    impl Entrypoints {
+        fn new(test: &str) -> Self {
+            let directory = std::env::temp_dir()
+                .join(format!("author-admission-{}-{test}", std::process::id()));
+            fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Entrypoints {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const MANIFEST: &[u8] = br#"{"required_features":["status","system.metrics"]}"#;
+    const ANSWER: &str = r#"{"type":"managed_hello","major":1,"minor":2,"identity":"github:7/fixture","session":"package-check","generation":"package-check""#;
+
+    #[test]
+    fn answers_the_host_would_admit_are_packaged() {
+        let entrypoints = Entrypoints::new("admitted");
+        for (name, body) in [
+            ("echo", "read line; printf '%s\\n' \"$line\"; read rest".to_owned()),
+            (
+                "reordered",
+                format!("read line; printf '%s\\n' '{ANSWER},\"features\":[\"system.metrics\",\"status\"],\"extra\":1}}'"),
+            ),
+            (
+                "preceded",
+                format!("read line; printf '%s\\n' 'starting' '{{\"type\":\"log\"}}' '{ANSWER},\"features\":[\"status\",\"system.metrics\"]}}'"),
+            ),
+        ] {
+            let path = entrypoints.script(name, &body);
+            admission(&path, 7, "fixture", MANIFEST).unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+    }
+
+    #[test]
+    fn answers_the_host_would_refuse_stop_packaging() {
+        let entrypoints = Entrypoints::new("refused");
+        for (name, body) in [
+            ("error", "read line; printf '{\"type\":\"error\"}\\n'".to_owned()),
+            ("silent", "exit 0".to_owned()),
+            ("failing", "read line; exit 3".to_owned()),
+            ("garbage", "read line; printf 'not json\\n'".to_owned()),
+            (
+                "missing",
+                format!("read line; printf '%s\\n' '{ANSWER},\"features\":[\"status\"]}}'"),
+            ),
+            (
+                "identity",
+                "read line; printf '%s\\n' '{\"type\":\"managed_hello\",\"major\":1,\"minor\":2,\"identity\":\"github:8/fixture\",\"session\":\"package-check\",\"generation\":\"package-check\",\"features\":[\"status\",\"system.metrics\"]}'".to_owned(),
+            ),
+        ] {
+            let path = entrypoints.script(name, &body);
+            let error = admission(&path, 7, "fixture", MANIFEST).unwrap_err();
+            assert!(error.to_string().starts_with("fixture: "), "{name}: {error}");
+        }
+        assert!(admission(
+            &entrypoints.script("echo", "read line; printf '%s\\n' \"$line\""),
+            7,
+            "fixture",
+            br#"{"required_features":"status"}"#,
+        )
+        .is_err());
     }
 }
