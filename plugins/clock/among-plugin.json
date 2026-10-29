@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "clock",
-  "version": "0.1.0-rc.1",
+  "version": "0.2.0",
   "name": "Clock",
   "description": "Local time in the application footer.",
   "entrypoint": "bin/clock-managed",

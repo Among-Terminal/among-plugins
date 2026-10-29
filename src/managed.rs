@@ -19,7 +19,12 @@ pub const MAX_CONTEXT_PAGE_BYTES: usize = 28 * 1024;
 pub const MAX_PENDING_STATUS: usize = 15;
 pub const MAX_RETAINED_ENCODED_BYTES: usize = MAX_PENDING_STATUS * MAX_FRAME_BYTES;
 pub const TRAVERSAL_BUDGET: Duration = Duration::from_secs(4);
-const STATUS_FEATURES: &[&str] = &["status", "context.terminals", "context.cwd"];
+const STATUS_FEATURES: &[&str] = &[
+    "status",
+    "context.terminals",
+    "context.cwd",
+    "system.metrics",
+];
 
 #[derive(Debug)]
 pub struct Profile<'a> {

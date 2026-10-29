@@ -1,10 +1,15 @@
 # Independent plugin packages
 
 Plugin versions belong to each static `plugins/<id>/among-plugin.json`, not the
-application or the historical Cargo package version. The first preparation uses
-`0.1.0-rc.1`; it creates no Git tag or published release. Change an individual
+application or the historical Cargo package version. The current manifests prepare
+`0.2.0`; preparation creates no Git tag or release. Change an individual
 manifest's version when that plugin's release changes. The README is the single
 human-readable catalogue; this guide intentionally does not maintain another list.
+
+For current schema2 release assets, native preparation and publication of exact
+approved bytes, use [the reusable workflow](author-release.md#publishing-approved-preparation-bytes).
+The official producer commands below also retain the historical schema1 catalogue
+format for artifact inspection; that catalogue is not an ordinary 0.2.x install input.
 
 ## Native preparation
 
@@ -50,7 +55,7 @@ every CPU extension, minimum kernel, distribution certification or reproducibili
 glibc, libgcc and timezone data are supplied by the target system. No external
 command grants or notification authority are declared by these status plugins.
 
-The installer catalogue and plugin manifests remain schema1. Producer schema2
+The historical official catalogue and plugin manifests use schema1. Producer schema2
 additionally requires the actual native builder's Rust release/commit/host,
 compiler hash, installed component manifests and runtime rlib digests. Packaging
 refuses absent/changed licence files, missing std/core/alloc/compiler-builtins
@@ -83,7 +88,11 @@ installation catalogue until real published asset identities are bound.
 Failed jobs also retain any partial package/inspection files; those artifacts are
 diagnostics, never accepted build inputs merely because they were uploaded.
 
-## Separately authorized release and catalogue
+## Historical schema1 catalogue inspection
+
+This records the original publication procedure. It does not authorize changing
+historical releases or publishing a new schema1 installation catalogue. New
+schema2 publication follows the exact-byte preparation procedure linked above.
 
 1. Obtain the distinct plugin tag/publication approval. Record the exact tag and
    reviewed source SHA; require current native CI and independent review. Preparing

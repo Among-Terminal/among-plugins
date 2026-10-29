@@ -19,6 +19,7 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools author-packages <source-root> <native-binary-directory> <vendor-directory> <repository-id> <new-output>
        among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output>
        among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
+       among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
        among-tools verify-release resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
        among-tools resolve-tag <repository-id> <tag>";
 
@@ -80,6 +81,18 @@ fn run() -> Result<()> {
                 Path::new(inventory),
                 workflow,
                 run.parse()?,
+                Path::new(output),
+            )
+        }
+        [command, prepared, repository, revision, tag, digest, output]
+            if command == "prepared-inventory" =>
+        {
+            author::prepared_inventory(
+                Path::new(prepared),
+                repository.parse()?,
+                revision,
+                tag,
+                digest,
                 Path::new(output),
             )
         }

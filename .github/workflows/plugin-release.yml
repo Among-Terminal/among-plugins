@@ -22,15 +22,19 @@ name: Plugin release
 # the per-tag concurrency group: a group here could deadlock with the caller's.
 #
 # With `publish: false` (for example on pull requests) it builds, packages and
-# catalogues the event commit, needs only `contents: read` and writes nothing.
+# catalogues the event commit, needs only `contents: read` and writes no release.
+# The complete candidate is retained as an Actions artifact. A later publish
+# can consume its exact bytes using the three prepared-* inputs, without
+# rebuilding plugins. That caller also grants `actions: read`.
 #
 # There is no workflow-level `permissions`: every job except publish lowers
 # its token to `contents: read`, and publish keeps the caller's token. GitHub
 # checks the permissions of every job of a called workflow when the run
 # starts, skipped ones included, so a publish job that asked for
 # `contents: write` itself would make a read-only caller in check mode fail
-# before anything runs. The caller must grant exactly `contents: write`:
-# nothing here can lower a broader token the caller passes to publish.
+# before anything runs. The caller grants `contents: write`, plus `actions: read`
+# when consuming a prior artifact; no other write permissions are needed.
+# Nothing here can lower a broader token the caller passes to publish.
 
 on:
   workflow_call:
@@ -39,6 +43,18 @@ on:
         description: Publish a release for the tag. false builds, packages and catalogues the event commit and writes nothing.
         type: boolean
         default: true
+      prepared-run-id:
+        description: Successful preparation run in this repository. Supply all three prepared inputs or none.
+        type: string
+        default: ''
+      prepared-artifact-id:
+        description: Exact plugin-release-candidate artifact ID from that run.
+        type: string
+        default: ''
+      prepared-sha256sums:
+        description: Owner-approved lowercase SHA256 of the SHA256SUMS bytes, not inventory.json.
+        type: string
+        default: ''
 
 jobs:
   pin:
@@ -49,6 +65,7 @@ jobs:
     outputs:
       commit: ${{ steps.pin.outputs.commit }}
       tag: ${{ steps.pin.outputs.tag }}
+      prepared: ${{ steps.pin.outputs.prepared }}
     steps:
       - name: Pin the tagged source commit without running author code
         id: pin
@@ -58,9 +75,21 @@ jobs:
           SHA: ${{ github.sha }}
           REPOSITORY_ID: ${{ github.repository_id }}
           PUBLISH: ${{ inputs.publish }}
+          PREPARED_RUN: ${{ inputs.prepared-run-id }}
+          PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
+          PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
         run: |
           set -euo pipefail
           printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
+          if [ -n "$PREPARED_RUN$PREPARED_ARTIFACT$PREPARED_DIGEST" ]; then
+            test "$PUBLISH" = true
+            printf '%s' "$PREPARED_RUN" | grep -Eqx '[1-9][0-9]{0,19}'
+            printf '%s' "$PREPARED_ARTIFACT" | grep -Eqx '[1-9][0-9]{0,19}'
+            printf '%s' "$PREPARED_DIGEST" | grep -Eqx '[0-9a-f]{64}'
+            echo "prepared=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prepared=false" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$PUBLISH" != true ]; then
             # A check run builds the event commit and publishes nothing.
             echo "commit=$SHA" >> "$GITHUB_OUTPUT"
@@ -133,6 +162,7 @@ jobs:
           retention-days: 5
 
   tools-arm64:
+    if: ${{ inputs.prepared-run-id == '' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
@@ -176,6 +206,7 @@ jobs:
           retention-days: 5
 
   build:
+    if: ${{ inputs.prepared-run-id == '' }}
     needs: [pin, tools-amd64, tools-arm64]
     timeout-minutes: 60
     permissions:
@@ -240,7 +271,8 @@ jobs:
         run: |
           set -euo pipefail
           cd author
-          printf '/target/\n/vendor/\n' >> .git/info/exclude
+          git check-ignore -q target/
+          git check-ignore -q vendor/
           mkdir vendor
           cargo +1.98.1 vendor --locked --versioned-dirs vendor > /dev/null
           ../tools/among-tools author-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$REPOSITORY_ID" "$RUNNER_TEMP/build-${{ matrix.architecture }}"
@@ -287,6 +319,10 @@ jobs:
           TAG: ${{ needs.pin.outputs.tag }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TOOL_REPOSITORY: ${{ job.workflow_repository }}
+          TOOL_REVISION: ${{ job.workflow_sha }}
+          TOOL_SHA256: ${{ needs['tools-amd64'].outputs.sha256 }}
         run: |
           set -euo pipefail
           tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
@@ -294,9 +330,24 @@ jobs:
           (cd release/assets && sha256sum -c SHA256SUMS)
           ls -l release/assets
           cat binding
+          jq -n --arg repository_id "$REPOSITORY_ID" --arg source "$PIN" \
+            --arg run "$RUN_ID" --arg attempt "$RUN_ATTEMPT" \
+            --arg tool_repository "$TOOL_REPOSITORY" --arg tool_revision "$TOOL_REVISION" \
+            --arg tool_sha256 "$TOOL_SHA256" --arg workflow_ref "$WORKFLOW_REF" \
+            '{repository_id:$repository_id,source:$source,run:$run,attempt:$attempt,
+              tool_repository:$tool_repository,tool_revision:$tool_revision,
+              tool_sha256:$tool_sha256,workflow_ref:$workflow_ref}' > release/preparation.json
+          cp binding release/preparation-binding.txt
+      - name: Retain the complete candidate, including catalogue and checksum bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plugin-release-candidate-${{ needs.pin.outputs.commit }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
 
   publish:
-    if: ${{ inputs.publish }}
+    if: ${{ always() && !cancelled() && inputs.publish && needs.pin.result == 'success' && needs['tools-amd64'].result == 'success' && (needs.build.result == 'success' || needs.pin.outputs.prepared == 'true') }}
     needs: [pin, tools-amd64, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -317,13 +368,44 @@ jobs:
           test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
           chmod 755 tools/among-tools
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ needs.pin.outputs.prepared != 'true' }}
         with:
           name: plugin-build-amd64
           path: build/amd64
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ needs.pin.outputs.prepared != 'true' }}
         with:
           name: plugin-build-arm64
           path: build/arm64
+      - name: Bind the approved artifact to a successful exact-source preparation
+        if: ${{ needs.pin.outputs.prepared == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          PIN: ${{ needs.pin.outputs.commit }}
+          PREPARED_RUN: ${{ inputs.prepared-run-id }}
+          PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
+        run: |
+          set -euo pipefail
+          gh api "repositories/$REPOSITORY_ID/actions/runs/$PREPARED_RUN" > preparation-run.json
+          jq -e --arg source "$PIN" --arg run "$PREPARED_RUN" --arg repository "$REPOSITORY_ID" \
+            '.id == ($run|tonumber) and .repository.id == ($repository|tonumber)
+              and .head_sha == $source and .status == "completed" and .conclusion == "success"' preparation-run.json
+          gh api "repositories/$REPOSITORY_ID/actions/artifacts/$PREPARED_ARTIFACT" > preparation-artifact.json
+          jq -e --arg source "$PIN" --arg run "$PREPARED_RUN" --arg artifact "$PREPARED_ARTIFACT" \
+            '.id == ($artifact|tonumber) and .workflow_run.id == ($run|tonumber)
+              and .workflow_run.head_sha == $source and .expired == false
+              and .name == ("plugin-release-candidate-" + $source)' preparation-artifact.json
+      - name: Download the approved candidate without native rebuilds
+        if: ${{ needs.pin.outputs.prepared == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ inputs.prepared-artifact-id }}
+          run-id: ${{ inputs.prepared-run-id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          merge-multiple: true
+          path: release
       - name: Catalogue, draft, verify, publish, verify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -333,11 +415,26 @@ jobs:
           TAG: ${{ needs.pin.outputs.tag }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           RUN_ID: ${{ github.run_id }}
+          PREPARED: ${{ needs.pin.outputs.prepared }}
+          PREPARED_RUN: ${{ inputs.prepared-run-id }}
+          PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
+          TOOL_REPOSITORY: ${{ job.workflow_repository }}
+          TOOL_REVISION: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
           tool="$PWD/tools/among-tools"
-          "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
-          "$tool" release-binding release/inventory.json "$WORKFLOW_REF" "$RUN_ID" binding
+          inventory="$PWD/release/inventory.json"
+          if [ "$PREPARED" = true ]; then
+            jq -e --arg repository "$REPOSITORY_ID" --arg source "$PIN" --arg run "$PREPARED_RUN" \
+              --arg tool_repository "$TOOL_REPOSITORY" --arg tool_revision "$TOOL_REVISION" \
+              '.repository_id == $repository and .source == $source and .run == $run
+                and .tool_repository == $tool_repository and .tool_revision == $tool_revision' release/preparation.json
+            inventory="$PWD/publication-inventory.json"
+            "$tool" prepared-inventory release "$REPOSITORY_ID" "$PIN" "$TAG" "$PREPARED_DIGEST" "$inventory"
+          else
+            "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
+          fi
+          "$tool" release-binding "$inventory" "$WORKFLOW_REF" "$RUN_ID" binding
           resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
           test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
           # Checks a published release against the whole expected snapshot.
@@ -346,7 +443,7 @@ jobs:
             test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
             gh api "repositories/$REPOSITORY_ID/releases/$1" > release.json
             gh api "repositories/$REPOSITORY_ID/releases/latest" > latest.json
-            "$tool" verify-release published release.json release/inventory.json binding latest.json
+            "$tool" verify-release published release.json "$inventory" binding latest.json
             echo "published $(jq -r .html_url release.json) for $TAG at $PIN"
           }
           # Drafts are only visible in the list; at most one may carry this tag.
@@ -363,7 +460,7 @@ jobs:
               verify_published "$id"
               exit 0
             fi
-            "$tool" verify-release resume release.json release/inventory.json binding > missing.txt
+            "$tool" verify-release resume release.json "$inventory" binding > missing.txt
           else
             # Drafts cannot be latest; publishing below makes it latest.
             gh api -X POST "repositories/$REPOSITORY_ID/releases" \
@@ -377,6 +474,6 @@ jobs:
             gh release upload "$TAG" "release/assets/$name"
           done < missing.txt
           gh api "repositories/$REPOSITORY_ID/releases/$id" > release.json
-          "$tool" verify-release draft release.json release/inventory.json binding
+          "$tool" verify-release draft release.json "$inventory" binding
           gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F draft=false > /dev/null
           verify_published "$id"
