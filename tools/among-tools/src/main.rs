@@ -4,6 +4,7 @@ mod catalogue;
 mod changed;
 mod package;
 mod process;
+mod release;
 mod source;
 mod strict;
 mod toolchain;
@@ -25,7 +26,46 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
        among-tools resolve-tag <repository-id> <tag>
        among-tools previous-catalogue <owner/name> <new-output>
-       among-tools changed-plugins <previous-catalogue.json> <build.json>...";
+       among-tools changed-plugins [--pending] <previous-catalogue.json> <build.json>...
+       among-tools plugin-release-plan <repo-root> <previous-catalogue.json> <previous-tag>|- [--rc N] [--apply] <build.json>...
+       among-tools plugin-release-pr <repo-root> <previous-catalogue.json> <previous-tag>|- [--rc N] [--dry-run] <build.json>...
+       among-tools snapshot-label <commit-subject> [<changed-file>...]
+       among-tools carry-over <owner/name> <previous-catalogue.json> <previous-tag> <fresh-catalogue.json> <new-output> <build.json>...";
+
+// `[--rc N] [--apply] [--dry-run] <build.json>...` after the three fixed
+// arguments of the release planning commands.
+fn release_options<'a>(
+    arguments: &'a [String],
+    paths: &'a mut Vec<&'a Path>,
+) -> Result<(release::Options<'a>, bool)> {
+    let [root, previous, tag, rest @ ..] = arguments else {
+        return Err(USAGE.into());
+    };
+    let (mut candidate, mut apply, mut dry_run) = (None, false, false);
+    let mut rest = rest.iter();
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--rc" => candidate = Some(rest.next().ok_or(USAGE)?.parse()?),
+            "--apply" => apply = true,
+            "--dry-run" => dry_run = true,
+            path => paths.push(Path::new(path)),
+        }
+    }
+    if paths.is_empty() {
+        return Err(USAGE.into());
+    }
+    Ok((
+        release::Options {
+            root: Path::new(root),
+            previous: Path::new(previous),
+            previous_tag: (tag != "-").then_some(tag.as_str()),
+            candidate,
+            apply,
+            builds: paths,
+        },
+        dry_run,
+    ))
+}
 
 fn channel(name: &str) -> Result<author::Channel> {
     match name {
@@ -154,9 +194,47 @@ fn run() -> Result<()> {
         [command, repository, output] if command == "previous-catalogue" => {
             changed::previous_catalogue(repository, Path::new(output))
         }
+        [command, flag, previous, builds @ ..]
+            if command == "changed-plugins" && flag == "--pending" && !builds.is_empty() =>
+        {
+            let builds: Vec<_> = builds.iter().map(Path::new).collect();
+            changed::run(Path::new(previous), &builds, true)
+        }
         [command, previous, builds @ ..] if command == "changed-plugins" && !builds.is_empty() => {
             let builds: Vec<_> = builds.iter().map(Path::new).collect();
-            changed::run(Path::new(previous), &builds)
+            changed::run(Path::new(previous), &builds, false)
+        }
+        [command, rest @ ..] if command == "plugin-release-plan" => {
+            let mut paths = Vec::new();
+            let (options, _) = release_options(rest, &mut paths)?;
+            let plan = release::run_plan(&options)?;
+            println!("{}", serde_json::to_string_pretty(&plan.to_json())?);
+            Ok(())
+        }
+        [command, rest @ ..] if command == "plugin-release-pr" => {
+            let mut paths = Vec::new();
+            let (options, dry_run) = release_options(rest, &mut paths)?;
+            release::run_release_pr(&options, dry_run)
+        }
+        [command, subject, files @ ..] if command == "snapshot-label" => {
+            let files: Vec<_> = files.iter().map(String::as_str).collect();
+            if let Some(label) = release::snapshot_label(subject, &files)? {
+                println!("{label}");
+            }
+            Ok(())
+        }
+        [command, repository, previous, tag, fresh, output, builds @ ..]
+            if command == "carry-over" && !builds.is_empty() =>
+        {
+            let builds: Vec<_> = builds.iter().map(Path::new).collect();
+            release::run_carry_over(
+                repository,
+                Path::new(previous),
+                tag,
+                Path::new(fresh),
+                Path::new(output),
+                &builds,
+            )
         }
         _ => Err(USAGE.into()),
     }

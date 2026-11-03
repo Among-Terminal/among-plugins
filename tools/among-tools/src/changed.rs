@@ -34,8 +34,8 @@ struct Member {
 }
 
 #[derive(Clone, Debug)]
-struct Plugin {
-    version: String,
+pub(crate) struct Plugin {
+    pub(crate) version: String,
     // The manifest without its `version`.
     manifest: Value,
     // Content members per architecture, build records removed.
@@ -87,7 +87,7 @@ fn plugin_of(manifest: &Value, architecture: &str, artifact: &Value) -> Result<P
 }
 
 // A release catalogue, schema 1 or 2: one version per plugin.
-fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
+pub(crate) fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
     match catalogue["schema_version"].as_u64() {
         Some(1 | 2) => {}
         other => return Err(format!("unsupported catalogue schema {other:?}").into()),
@@ -135,7 +135,7 @@ fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
 }
 
 // The `build.json` that `plugin-packages` writes for one architecture.
-fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
+pub(crate) fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
     let mut plugins: BTreeMap<String, Plugin> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for build in builds {
@@ -175,7 +175,7 @@ fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Identifier {
+pub(crate) enum Identifier {
     Number(u64),
     Text(String),
 }
@@ -184,9 +184,9 @@ enum Identifier {
 // Build metadata is refused: a plugin version that differs only by metadata
 // would compare equal and hide a missing raise.
 #[derive(Debug, PartialEq, Eq)]
-struct Version {
-    core: [u64; 3],
-    pre: Vec<Identifier>,
+pub(crate) struct Version {
+    pub(crate) core: [u64; 3],
+    pub(crate) pre: Vec<Identifier>,
 }
 
 fn number(part: &str) -> Option<u64> {
@@ -197,7 +197,7 @@ fn number(part: &str) -> Option<u64> {
 }
 
 impl Version {
-    fn parse(version: &str) -> Result<Self> {
+    pub(crate) fn parse(version: &str) -> Result<Self> {
         let fail = || format!("`{version}` is not a semantic version without build metadata");
         let (core, pre) = match version.split_once('-') {
             Some((core, pre)) => (core, Some(pre)),
@@ -263,7 +263,7 @@ impl PartialOrd for Version {
 // What differs between the previous and the current plugin, empty when equal.
 // Only architectures that were just built are compared, so a job that packages
 // one architecture does not call the other one changed.
-fn differences(previous: &Plugin, current: &Plugin) -> Vec<String> {
+pub(crate) fn differences(previous: &Plugin, current: &Plugin) -> Vec<String> {
     let mut found = Vec::new();
     if previous.manifest != current.manifest {
         found.push("manifest".to_owned());
@@ -289,7 +289,14 @@ pub struct Report {
     pub failures: usize,
 }
 
-fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugin>) -> Report {
+// With `pending`, changed content at an unchanged version passes: that is the
+// state of every ordinary pull request, because the version is raised once, by
+// the release pull request. Everything else is refused in both modes.
+fn compare(
+    previous: &BTreeMap<String, Plugin>,
+    current: &BTreeMap<String, Plugin>,
+    pending: bool,
+) -> Report {
     let mut report = Report {
         lines: Vec::new(),
         failures: 0,
@@ -337,6 +344,13 @@ fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugi
                 format!("version fell from {} to {}", before.version, now.version),
             ),
             (Ordering::Equal, true) => (true, format!("unchanged at {}", now.version)),
+            (Ordering::Equal, false) if pending => (
+                true,
+                format!(
+                    "packaged content changed ({list}); the release raises the version from {}",
+                    now.version
+                ),
+            ),
             (Ordering::Equal, false) => (
                 false,
                 format!(
@@ -371,11 +385,15 @@ fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugi
     report
 }
 
-pub fn check(catalogue: &Value, builds: &[Value]) -> Result<Report> {
-    Ok(compare(&from_catalogue(catalogue)?, &from_builds(builds)?))
+pub fn check(catalogue: &Value, builds: &[Value], pending: bool) -> Result<Report> {
+    Ok(compare(
+        &from_catalogue(catalogue)?,
+        &from_builds(builds)?,
+        pending,
+    ))
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     let bytes = std::fs::read(path)?;
     if bytes.len() > 32 * MAX_CATALOGUE_BYTES {
         return Err(format!("{} is unreasonably large", path.display()).into());
@@ -383,13 +401,13 @@ fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub fn run(previous: &Path, builds: &[&Path]) -> Result<()> {
+pub fn run(previous: &Path, builds: &[&Path], pending: bool) -> Result<()> {
     let catalogue = read_json(previous)?;
     let builds = builds
         .iter()
         .map(|path| read_json(path))
         .collect::<Result<Vec<_>>>()?;
-    let report = check(&catalogue, &builds)?;
+    let report = check(&catalogue, &builds, pending)?;
     for line in &report.lines {
         println!("{line}");
     }
@@ -448,14 +466,15 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
         &[],
         8 * MAX_CATALOGUE_BYTES,
     )?;
-    let bytes = match newest_with_catalogue(&serde_json::from_slice(&releases)?)? {
+    let newest = newest_with_catalogue(&serde_json::from_slice(&releases)?)?;
+    let bytes = match &newest {
         Some(tag) => {
             eprintln!("previous release: {tag}");
             let bytes = process::capture(
                 Command::new("gh").args([
                     "release",
                     "download",
-                    &tag,
+                    tag,
                     "-R",
                     repository,
                     "-p",
@@ -477,7 +496,11 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
             empty
         }
     };
-    archive::write_new(output, &bytes)
+    archive::write_new(output, &bytes)?;
+    // The tag of the previous release on stdout (an empty line when there is
+    // none), for the release planner.
+    println!("{}", newest.unwrap_or_default());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -518,7 +541,22 @@ mod tests {
     }
 
     fn verdict(previous: &Value, built: &Value) -> Report {
-        check(previous, std::slice::from_ref(built)).unwrap()
+        check(previous, std::slice::from_ref(built), false).unwrap()
+    }
+
+    #[test]
+    fn pending_mode_accepts_only_changed_content_at_the_same_version() {
+        let previous = catalogue("0.2.0", "bin-a", "c", "r");
+        let changed = build("0.2.0", "bin-b", "c", "r");
+        let report = check(&previous, std::slice::from_ref(&changed), true).unwrap();
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        // A raise without content and a falling version stay refused.
+        let raised = build("0.2.1", "bin-a", "c", "r");
+        assert_eq!(check(&previous, &[raised], true).unwrap().failures, 1);
+        let lower = build("0.1.9", "bin-b", "c", "r");
+        assert_eq!(check(&previous, &[lower], true).unwrap().failures, 1);
+        // Strict mode still refuses the first case.
+        assert_eq!(check(&previous, &[changed], false).unwrap().failures, 1);
     }
 
     #[test]
@@ -718,7 +756,12 @@ mod tests {
     #[test]
     fn build_records_for_the_same_architecture_twice_are_refused() {
         let one = build("0.2.0", "bin-a", "c", "r");
-        assert!(check(&catalogue("0.2.0", "bin-a", "c", "r"), &[one.clone(), one]).is_err());
+        assert!(check(
+            &catalogue("0.2.0", "bin-a", "c", "r"),
+            &[one.clone(), one],
+            false
+        )
+        .is_err());
     }
 
     #[test]

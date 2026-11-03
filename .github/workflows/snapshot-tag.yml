@@ -1,0 +1,54 @@
+name: Snapshot tag
+
+# When the release pull request is merged (a squash commit titled
+# `chore(release): v<label>` that changes nothing but plugin manifests), this
+# creates the one `v<label>` tag on that commit and starts the preparation run of
+# the official release workflow on it. It publishes nothing: publication stays
+# the owner's manual run of that workflow with the approved prepared bytes.
+#
+# A tag created with the workflow token does not start `push` workflows, but a
+# `workflow_dispatch` does run, so the preparation is dispatched explicitly.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: snapshot-tag
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tag:
+    if: "${{ startsWith(github.event.head_commit.message, 'chore(release): ') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Install the pinned Rust tools
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Create the snapshot tag and start the preparation
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          subject="${MESSAGE%%$'\n'*}"
+          mapfile -t files < <(git diff-tree --no-commit-id --name-only -r --no-renames "$GITHUB_SHA")
+          label=$(cargo run --quiet --manifest-path tools/among-tools/Cargo.toml --locked -- snapshot-label "$subject" "${files[@]}")
+          if [ -z "$label" ]; then
+            echo "Not a release commit: nothing to tag."
+            exit 0
+          fi
+          # Fails when the tag already exists, so a tag is never moved.
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$label" -f "sha=$GITHUB_SHA" > /dev/null
+          gh workflow run official-plugin-release.yml --ref "$label"
+          echo "Tagged $GITHUB_SHA as $label and started the preparation run."

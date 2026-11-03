@@ -77,7 +77,12 @@ jobs:
           tool="$PWD/tools/among-tools/target/debug/among-tools"
           build="dist/${{ matrix.architecture }}/build.json"
           "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
-          "$tool" changed-plugins "$RUNNER_TEMP/previous-catalogue.json" "$build"
+          # An ordinary pull request changes content and leaves the versions to
+          # the release pull request (branch release/<label>), which must show
+          # every changed plugin at a raised version.
+          mode=(--pending)
+          case "${GITHUB_HEAD_REF:-}" in release/*) mode=() ;; esac
+          "$tool" changed-plugins "${mode[@]}" "$RUNNER_TEMP/previous-catalogue.json" "$build"
       - name: The changed-plugin check separates same content from changed content
         run: |
           set -euo pipefail
@@ -97,6 +102,15 @@ jobs:
           fi
           cat "$RUNNER_TEMP/mutated.log"
           grep -E '^FAIL .*: packaged content changed .* the version is still ' "$RUNNER_TEMP/mutated.log"
+          # The same change passes as a pending release, and a version raise
+          # over unchanged content still fails.
+          "$tool" changed-plugins --pending "$baseline" "$mutated"
+          raised="$RUNNER_TEMP/raised-build.json"
+          jq '.packages[0].manifest.version = "99.0.0"' "$build" > "$raised"
+          if "$tool" changed-plugins --pending "$baseline" "$raised" > /dev/null 2>&1; then
+            echo "a version raise without a content change was accepted" >&2
+            exit 1
+          fi
       - name: A manifest without system.metrics is not packaged for the real binary
         run: |
           set -euo pipefail
