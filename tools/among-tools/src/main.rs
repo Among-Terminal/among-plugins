@@ -34,6 +34,7 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools verify-references <owner/name> <catalogue.json> <previous-catalogue.json> <previous-tag>
        among-tools verify-references <owner/name> <catalogue.json>
        among-tools check-stable-release <owner/name> <tag> [<candidate-tag>]
+       among-tools first-release <owner/name> <commit>
        among-tools promote-candidate <owner/name> <candidate-tag>
        among-tools verify-candidate <owner/name> <candidate-tag> <stable-tag> <inventory.json>";
 
@@ -263,6 +264,9 @@ fn run() -> Result<()> {
         }
         [command, repository, catalogue] if command == "verify-references" => {
             release::run_verify_catalogue_references(repository, Path::new(catalogue))
+        }
+        [command, repository, commit] if command == "first-release" => {
+            release::run_first_release(repository, commit)
         }
         [command, repository, candidate] if command == "promote-candidate" => {
             release::run_promote(repository, candidate)

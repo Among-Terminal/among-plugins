@@ -474,28 +474,61 @@ pub fn run_check_stable(repository: &str, tag: &str, candidate: Option<&str>) ->
     check_stable_publication(tag, &candidate_tags(repository, tag)?, candidate)
 }
 
-// The release commit of a candidate: titled `chore(release): <candidate tag>`
-// (with the pull request number a squash adds), and checked by a successful
-// push run of the repository's checks, which verified it strictly.
+// What the commit of a candidate must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitRule {
+    // The release commit, titled `chore(release): <candidate tag>` (with the
+    // pull request number a squash adds). Every release has one, because a
+    // release raises versions and that is what the commit does.
+    ReleaseCommit,
+    // The first release of the repository raises nothing: its manifests already
+    // carry the versions to release and no previous release exists, so there is
+    // no release commit. Any commit that is an ancestor of the default branch
+    // will do (`on_main` says whether this one is).
+    FirstRelease { on_main: bool },
+}
+
+// The first release is the first label with no other release that has a
+// catalogue. A second candidate of the first label is not the first release:
+// the first candidate is a release with a catalogue.
+pub(crate) fn is_first_release(stable_label: &str, other_release_with_catalogue: bool) -> bool {
+    stable_label == FIRST_LABEL && !other_release_with_catalogue
+}
+
+// The commit of a candidate: titled by `rule`, and checked by a successful push
+// run of the repository's checks on the default branch, which verified it.
 pub(crate) fn check_candidate_commit(
     message: &str,
     runs: &Value,
     candidate_tag: &str,
+    rule: CommitRule,
 ) -> Result<()> {
-    let subject = message.lines().next().unwrap_or_default();
-    let subject = subject
-        .split_once(" (#")
-        .map_or(subject, |(title, _)| title);
-    if subject != format!("chore(release): {candidate_tag}") {
-        return Err(format!(
-            "the commit of {candidate_tag} is not its release commit (its title is `{subject}`)"
-        )
-        .into());
+    match rule {
+        CommitRule::ReleaseCommit => {
+            let subject = message.lines().next().unwrap_or_default();
+            let subject = subject
+                .split_once(" (#")
+                .map_or(subject, |(title, _)| title);
+            if subject != format!("chore(release): {candidate_tag}") {
+                return Err(format!(
+                    "the commit of {candidate_tag} is not its release commit (its title is `{subject}`)"
+                )
+                .into());
+            }
+        }
+        CommitRule::FirstRelease { on_main: false } => {
+            return Err(format!(
+                "the commit of {candidate_tag} is not an ancestor of the default branch"
+            )
+            .into());
+        }
+        CommitRule::FirstRelease { on_main: true } => {}
     }
     let verified = runs["workflow_runs"].as_array().is_some_and(|all| {
         all.iter().any(|run| {
             run["name"] == "Locked Rust source checks"
                 && run["event"] == "push"
+                && run["head_branch"] == "main"
                 && run["conclusion"] == "success"
         })
     });
@@ -508,17 +541,88 @@ pub(crate) fn check_candidate_commit(
     Ok(())
 }
 
+// Whether `commit` is an ancestor of (or is) the default branch: the merge base
+// of the two is the commit itself.
+fn commit_on_main(repository: &str, commit: &str) -> Result<bool> {
+    let comparison = release_json(repository, &format!("compare/{commit}...main"))?;
+    Ok(comparison["merge_base_commit"]["sha"].as_str() == Some(commit))
+}
+
 fn require_candidate_commit(repository: &str, commit: &str, candidate_tag: &str) -> Result<()> {
     let record = release_json(repository, &format!("commits/{commit}"))?;
     let runs = release_json(
         repository,
         &format!("actions/runs?head_sha={commit}&per_page=100"),
     )?;
+    // The first release has no release commit; every other one has.
+    let first = is_first_release(
+        &stable_label(candidate_tag)?,
+        fetch_previous(repository, Some(candidate_tag), false)?
+            .0
+            .is_some(),
+    );
+    let rule = if first {
+        CommitRule::FirstRelease {
+            on_main: commit_on_main(repository, commit)?,
+        }
+    } else {
+        CommitRule::ReleaseCommit
+    };
     check_candidate_commit(
         record["commit"]["message"].as_str().unwrap_or_default(),
         &runs,
         candidate_tag,
+        rule,
     )
+}
+
+// What the operator does for the first release: the candidate tag goes on a
+// commit of the default branch that the checks have passed on.
+fn first_release_text(repository: &str, candidate: &str, commit: &str) -> String {
+    format!(
+        "the first release: no release with a catalogue exists, and {candidate} may go on\n\
+         {commit}, a commit of the default branch with a successful push run of the checks.\n\n\
+         1. gh api repos/{repository}/git/refs -f ref=refs/tags/{candidate} -f sha={commit}\n\
+         2. run `Official plugin candidate` on {candidate} with publish=false, inspect the run,\n\
+         \x20  get the owner's approval of the exact tag, commit and bytes, then run it with\n\
+         \x20  publish=true, prerelease=true and the approved run, artifact and checksum inputs\n\
+         3. later, `promote-candidate {repository} {candidate}` for the stable release\n"
+    )
+}
+
+// `first-release`: checks that a commit can carry the first candidate and prints
+// the steps. It creates nothing; the tag is the owner's separate decision.
+pub fn run_first_release(repository: &str, commit: &str) -> Result<()> {
+    valid_repository(repository)?;
+    if !crate::package::hex(commit, 40) {
+        return Err("the commit must be a full 40-digit commit id".into());
+    }
+    if let (Some(tag), _) = fetch_previous(repository, None, false)? {
+        return Err(format!(
+            "{tag} already is a release with a catalogue: this is not the first release"
+        )
+        .into());
+    }
+    let candidate = format!("{FIRST_LABEL}-rc.1");
+    for tag in [FIRST_LABEL, candidate.as_str()] {
+        if tag_exists(repository, tag)? {
+            return Err(format!("the tag {tag} already exists").into());
+        }
+    }
+    let runs = release_json(
+        repository,
+        &format!("actions/runs?head_sha={commit}&per_page=100"),
+    )?;
+    check_candidate_commit(
+        "",
+        &runs,
+        &candidate,
+        CommitRule::FirstRelease {
+            on_main: commit_on_main(repository, commit)?,
+        },
+    )?;
+    print!("{}", first_release_text(repository, &candidate, commit));
+    Ok(())
 }
 
 // Writes `catalogue.json` and, when there is a previous release, its record
@@ -2075,15 +2179,16 @@ mod tests {
 
     #[test]
     fn the_commit_of_a_candidate_is_its_verified_release_commit() {
-        let run = |name: &str, event: &str, conclusion: &str| json!({"workflow_runs": [{"name": name, "event": event, "conclusion": conclusion}]});
-        let passed = run("Locked Rust source checks", "push", "success");
+        let release = CommitRule::ReleaseCommit;
+        let passed = checks_run("Locked Rust source checks", "push", "main", "success");
         let title = "chore(release): v0.2.0-rc.1";
-        assert!(check_candidate_commit(title, &passed, "v0.2.0-rc.1").is_ok());
+        assert!(check_candidate_commit(title, &passed, "v0.2.0-rc.1", release).is_ok());
         // A squash commit carries the pull request number and a body.
         assert!(check_candidate_commit(
             "chore(release): v0.2.0-rc.1 (#18)\n\nbody",
             &passed,
-            "v0.2.0-rc.1"
+            "v0.2.0-rc.1",
+            release
         )
         .is_ok());
         // Another title, another candidate's title, an ordinary commit.
@@ -2093,19 +2198,82 @@ mod tests {
             "chore(release): v0.2.0",
         ] {
             assert!(
-                check_candidate_commit(other, &passed, "v0.2.0-rc.1").is_err(),
+                check_candidate_commit(other, &passed, "v0.2.0-rc.1", release).is_err(),
                 "{other}"
             );
         }
-        // The checks must have passed on a push, not failed, not run elsewhere.
-        for bad in [
-            run("Locked Rust source checks", "push", "failure"),
-            run("Locked Rust source checks", "pull_request", "success"),
-            run("Other", "push", "success"),
-            json!({"workflow_runs": []}),
-        ] {
-            assert!(check_candidate_commit(title, &bad, "v0.2.0-rc.1").is_err());
+        for bad in unverified_runs() {
+            assert!(check_candidate_commit(title, &bad, "v0.2.0-rc.1", release).is_err());
         }
+    }
+
+    fn checks_run(name: &str, event: &str, branch: &str, conclusion: &str) -> Value {
+        json!({"workflow_runs": [{"name": name, "event": event,
+                                  "head_branch": branch, "conclusion": conclusion}]})
+    }
+
+    // The checks must have passed, on a push, to the default branch.
+    fn unverified_runs() -> Vec<Value> {
+        vec![
+            checks_run("Locked Rust source checks", "push", "main", "failure"),
+            checks_run(
+                "Locked Rust source checks",
+                "pull_request",
+                "main",
+                "success",
+            ),
+            checks_run("Locked Rust source checks", "push", "topic", "success"),
+            checks_run("Other", "push", "main", "success"),
+            json!({"workflow_runs": []}),
+        ]
+    }
+
+    #[test]
+    fn the_first_release_may_be_any_verified_commit_of_the_default_branch() {
+        let passed = checks_run("Locked Rust source checks", "push", "main", "success");
+        let first = CommitRule::FirstRelease { on_main: true };
+        // The first release candidate, promoted to stable: no release commit, an
+        // ordinary commit that the checks passed on.
+        assert!(is_first_release("v0.2.0", false));
+        assert!(
+            check_candidate_commit("feat: an ordinary commit", &passed, "v0.2.0-rc.1", first)
+                .is_ok()
+        );
+        // A non-first release still needs its release commit: the ordinary
+        // commit is refused under the rule that every other release gets.
+        assert!(!is_first_release("v0.3.0", false));
+        assert!(
+            !is_first_release("v0.2.0", true),
+            "a second candidate of v0.2.0"
+        );
+        assert!(check_candidate_commit(
+            "feat: an ordinary commit",
+            &passed,
+            "v0.3.0-rc.1",
+            CommitRule::ReleaseCommit
+        )
+        .is_err());
+        // A commit that is not an ancestor of the default branch is refused.
+        let off = CommitRule::FirstRelease { on_main: false };
+        let error = check_candidate_commit("feat: x", &passed, "v0.2.0-rc.1", off)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an ancestor"), "{error}");
+        // So is one without a successful push run of the checks on main.
+        for bad in unverified_runs() {
+            assert!(check_candidate_commit("feat: x", &bad, "v0.2.0-rc.1", first).is_err());
+        }
+    }
+
+    #[test]
+    fn the_first_release_text_names_the_tag_and_the_commit() {
+        let text = first_release_text("o/r", "v0.2.0-rc.1", &"a".repeat(40));
+        assert!(
+            text.contains("-f ref=refs/tags/v0.2.0-rc.1 -f sha=aaaa"),
+            "{text}"
+        );
+        assert!(text.contains("promote-candidate o/r v0.2.0-rc.1"));
+        assert!(text.contains("owner's approval"));
     }
 
     #[test]

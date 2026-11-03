@@ -182,6 +182,33 @@ for a release tag the release workflow fetches the previous release with `previo
 A check run on a pull request (not for a release tag) catalogues every plugin, so that it
 passes when nothing changed.
 
+### The first release
+
+The first release of the repository (`v0.2.0`) has no previous release with a catalogue, and
+its manifests already say `0.2.0`, so there is nothing to raise and no `chore(release):`
+commit. Everything else about it is the same: all plugins are new, none is carried over, and
+the stable release is made from a candidate's bytes (see below). Only the commit rule differs:
+
+- for the first release, and only for it, the commit of the candidate may be any commit that
+  is an ancestor of `main` and has a successful push run of `Locked Rust source checks` on
+  `main`;
+- every other release keeps the rule that its commit is titled `chore(release): <tag>`. A
+  second candidate of the first label is not the first release, because the first candidate
+  already is a release with a catalogue.
+
+`among-tools first-release Among-Terminal/among-plugins <commit>` checks that no release with
+a catalogue exists, that neither `v0.2.0` nor `v0.2.0-rc.1` exists, that the commit is an
+ancestor of `main` (its merge base with `main` is the commit) and that the checks passed on it,
+and prints the steps. It creates nothing. The steps are:
+
+1. The owner creates the tag `v0.2.0-rc.1` at that commit (the command prints the `gh api` call).
+   This is a tag, so it needs the owner's separate decision.
+2. `Official plugin candidate` runs on the tag with `publish` off; the bytes are inspected and
+   the owner approves the exact tag, commit and bytes.
+3. The same workflow publishes the approved bytes with `prerelease` and the prepared inputs.
+4. For the stable release, `promote-candidate` and the steps below apply; for this first
+   release `promote-candidate` and `verify-candidate` accept the commit described above.
+
 ### Release candidates and the stable release made from one
 
 A candidate is a prerelease of the same repository with a tag `v<label>-rc.N`. Plugin
@@ -230,8 +257,9 @@ empty list meaning "no", never from the text of an error.
 1. `among-tools promote-candidate Among-Terminal/among-plugins v<label>-rc.N` checks that the
    candidate is a published immutable prerelease, that its tag still resolves to the commit
    in its release binding, that this commit is the release commit titled
-   `chore(release): v<label>-rc.N` and that a successful push run of the checks exists for it
-   (the run that verified it strictly), that the stable tag does not exist yet, and lists the
+   `chore(release): v<label>-rc.N` (for the first release: an ancestor of `main`, see above)
+   and that a successful push run of the checks exists for it on `main` (the run that verified
+   it), that the stable tag does not exist yet, and lists the
    unexpired preparation artifacts of that commit. It creates nothing and prints the steps.
 2. The owner creates the tag `v<label>` at that commit (the command prints the `gh api` call).
    No workflow creates it.
@@ -397,7 +425,9 @@ is reviewed like code. The file is the intended state; GitHub holds the active c
   Do not require a check that a path filter, an `if:` condition or a fork can skip:
   a check that never reports leaves the pull request pending forever. For the same
   reason the jobs of the nested `release-workflow-check` call are not required; they
-  are skipped outside `Among-Terminal/among-plugins`.
+  are skipped outside `Among-Terminal/among-plugins`. The job `workflow-scripts` runs on
+  every pull request but only exists on a branch once the pull request that adds it is
+  merged, so it joins the required checks after that merge, in the order given below.
 - The up-to-date requirement (`strict_required_status_checks_policy`) is off, so
   parallel pull requests do not force each other to rebase.
 - Required check names are the exact job names, including the matrix values. Renaming
