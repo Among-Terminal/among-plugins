@@ -132,3 +132,34 @@ schema2 publication follows the exact-byte preparation procedure linked above.
 
 The catalogue generator is read-only toward GitHub. It cannot create, upload,
 publish, mutate tags, install plugins, grant permissions or enable processes.
+
+## Default branch protection
+
+The ruleset of the default branch is kept in
+[`.github/rulesets/main.json`](../.github/rulesets/main.json) so that a change to it
+is reviewed like code. The file is the intended state; GitHub holds the active copy.
+
+- Pull requests merge by squash only, so the pull request title becomes the commit
+  subject. The `pr-title` check rejects a title that is not a Conventional Commit
+  (`feat`, `fix`, `docs`, `test`, `ci`, `build`, `perf`, `refactor`, `chore`, an
+  optional `(scope)`, and `!` before the colon for a breaking change).
+- Every required check is a job that runs on every pull request. `checks.yml` has no
+  path filter, so a documentation-only pull request runs and passes the same jobs.
+  Do not require a check that a path filter, an `if:` condition or a fork can skip:
+  a check that never reports leaves the pull request pending forever. For the same
+  reason the jobs of the nested `release-workflow-check` call are not required; they
+  are skipped outside `Among-Terminal/among-plugins`.
+- The up-to-date requirement (`strict_required_status_checks_policy`) is off, so
+  parallel pull requests do not force each other to rebase.
+- Required check names are the exact job names, including the matrix values. Renaming
+  a job or changing a matrix key of `native`, `packager-regression` or `author-packages`
+  therefore also changes the ruleset in the same pull request.
+
+Apply the file to the existing ruleset (an owner action) and compare the result:
+
+```sh
+gh api -X PUT repos/Among-Terminal/among-plugins/rulesets/25731537 --input .github/rulesets/main.json
+gh api repos/Among-Terminal/among-plugins/rulesets/25731537 |
+  jq -S '{name,target,enforcement,conditions,bypass_actors,rules}' |
+  diff - <(jq -S . .github/rulesets/main.json) && echo "ruleset matches the file"
+```
