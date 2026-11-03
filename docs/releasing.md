@@ -45,8 +45,10 @@ snapshot is published.
 ### Checking versions against the previous release
 
 `among-tools changed-plugins` compares the plugins that were just packaged (the
-`build.json` that `plugin-packages` writes, one per architecture) with the catalogue of
-the previous release and fails when:
+`build.json` that `author-packages` writes, one per architecture) with the catalogue of
+the previous release. It must be `author-packages`, because that is what a release
+packages with; the output of the official `plugin-packages` has other members and would
+differ from every release catalogue. The check fails when:
 
 - a plugin's packaged content changed but its version did not;
 - a plugin's version rose but its packaged content did not;
@@ -81,8 +83,8 @@ tagged.
 
 ```sh
 among-tools previous-catalogue Among-Terminal/among-plugins previous-catalogue.json
-among-tools changed-plugins --pending previous-catalogue.json dist/amd64/build.json dist/arm64/build.json
-among-tools changed-plugins previous-catalogue.json dist/amd64/build.json dist/arm64/build.json
+among-tools changed-plugins --pending previous-catalogue.json dist/author-amd64/build.json dist/author-arm64/build.json
+among-tools changed-plugins previous-catalogue.json dist/author-amd64/build.json dist/author-arm64/build.json
 ```
 
 When a version rose without a content change, or fell, revert the version.

@@ -69,6 +69,14 @@ jobs:
           cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > dist/vendor-config.toml
           tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$PWD/dist/${{ matrix.architecture }}"
           (cd "dist/${{ matrix.architecture }}" && sha256sum -c SHA256SUMS)
+      - name: Package the plugins the way a release does, for the version check
+        run: |
+          set -euo pipefail
+          # A release packages with author-packages and a vendor tree of this
+          # crate alone, so the version check compares the same kind of package
+          # (same members) that the previous release's catalogue lists.
+          cargo +1.98.1 vendor --locked --versioned-dirs dist/vendor-author > /dev/null
+          tools/among-tools/target/debug/among-tools author-packages "$PWD" "$PWD/target/release" "$PWD/dist/vendor-author" "${{ github.repository_id }}" "$PWD/dist/author-${{ matrix.architecture }}"
       - name: Plugin versions match what changed since the previous release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           tool="$PWD/tools/among-tools/target/debug/among-tools"
-          build="dist/${{ matrix.architecture }}/build.json"
+          build="dist/author-${{ matrix.architecture }}/build.json"
           "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
           # An ordinary change leaves the versions to the release pull request
           # and is checked as pending: changed content at the previous version
@@ -98,7 +106,7 @@ jobs:
           # build whose content did not change: it must pass. Changing one
           # executable digest in the build without raising its version must fail.
           tool="$PWD/tools/among-tools/target/debug/among-tools"
-          build="dist/${{ matrix.architecture }}/build.json"
+          build="dist/author-${{ matrix.architecture }}/build.json"
           baseline="$RUNNER_TEMP/baseline-catalogue.json"
           jq '{schema_version: 2, plugins: [.packages[] | {id: .manifest.id, versions: [{manifest, artifacts: [.artifact]}]}]}' "$build" > "$baseline"
           "$tool" changed-plugins "$baseline" "$build"
@@ -123,6 +131,13 @@ jobs:
             cat "$RUNNER_TEMP/raised.log"
             grep -E '^FAIL .*: version rose from .* but the packaged content is unchanged' "$RUNNER_TEMP/raised.log"
           done
+      - name: Retain the build records the version check read
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plugin-version-builds-${{ matrix.architecture }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/author-${{ matrix.architecture }}/build.json
+          if-no-files-found: error
+          retention-days: 14
       - name: A manifest without system.metrics is not packaged for the real binary
         run: |
           set -euo pipefail
