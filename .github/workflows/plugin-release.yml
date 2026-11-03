@@ -80,6 +80,40 @@ jobs:
       # catalogues every plugin so that it still passes when none changed.
       carry_tag: ${{ steps.pin.outputs.carry_tag }}
     steps:
+      - name: Check the candidate-tag input
+        id: candidate
+        env:
+          REF: ${{ github.ref }}
+          PUBLISH: ${{ inputs.publish }}
+          PREPARED_RUN: ${{ inputs.prepared-run-id }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          CANDIDATE_TAG: ${{ inputs.candidate-tag }}
+        run: |
+          set -euo pipefail
+          # Only a stable publication from prepared bytes, on the stable tag
+          # v0.2.0, names a candidate, and only one of that tag: v0.2.0-rc.N.
+          # Each condition is its own test: in a `test a && test b && test c`
+          # list a failing test that is not the last one does not stop the
+          # script under `set -e`.
+          if [ -z "$CANDIDATE_TAG" ]; then
+            exit 0
+          fi
+          fail() { echo "candidate-tag $CANDIDATE_TAG: $1" >&2; exit 1; }
+          if [ "$PUBLISH" != true ]; then fail "needs publish"; fi
+          if [ -z "$PREPARED_RUN" ]; then fail "needs the prepared inputs"; fi
+          if [ "$PRERELEASE" != false ]; then fail "a stable release is not a prerelease"; fi
+          case "$REF" in
+            refs/tags/v*) tag="${REF#refs/tags/}" ;;
+            *) fail "needs a v* tag, not $REF" ;;
+          esac
+          case "$tag" in *-*) fail "needs a stable tag, not $tag" ;; esac
+          case "$CANDIDATE_TAG" in
+            "$tag"-rc.*) ;;
+            *) fail "is not a candidate of $tag" ;;
+          esac
+          if ! printf '%s' "${CANDIDATE_TAG#"$tag"-rc.}" | grep -Eqx '[1-9][0-9]{0,8}'; then
+            fail "has no candidate number"
+          fi
       - name: Pin the tagged source commit without running author code
         id: pin
         env:
@@ -91,15 +125,9 @@ jobs:
           PREPARED_RUN: ${{ inputs.prepared-run-id }}
           PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
           PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
-          CANDIDATE_TAG: ${{ inputs.candidate-tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
-          if [ -n "$CANDIDATE_TAG" ]; then
-            # Only a stable publication from prepared bytes names a candidate.
-            test "$PUBLISH" = true && test -n "$PREPARED_RUN" && test "$PRERELEASE" = false
-          fi
           if [ -n "$PREPARED_RUN$PREPARED_ARTIFACT$PREPARED_DIGEST" ]; then
             test "$PUBLISH" = true
             printf '%s' "$PREPARED_RUN" | grep -Eqx '[1-9][0-9]{0,19}'
@@ -126,12 +154,6 @@ jobs:
             *) echo "plugin releases run on a v* tag, not $REF" >&2; exit 1 ;;
           esac
           printf '%s' "$tag" | grep -Eqx '[A-Za-z0-9._-]{1,128}'
-          if [ -n "$CANDIDATE_TAG" ]; then
-            # v0.2.0 may be made from v0.2.0-rc.N and from nothing else.
-            case "$tag" in *-*) echo "a candidate-tag needs a stable tag, not $tag" >&2; exit 1 ;; esac
-            test "${CANDIDATE_TAG%-rc.*}" = "$tag"
-            printf '%s' "${CANDIDATE_TAG##*-rc.}" | grep -Eqx '[1-9][0-9]{0,8}'
-          fi
           # Peel annotated tags through the API of the numeric repository.
           kind=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.type)
           object=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.sha)
@@ -281,7 +303,8 @@ jobs:
           EXPECTED: ${{ matrix.architecture == 'amd64' && needs['tools-amd64'].outputs.sha256 || needs['tools-arm64'].outputs.sha256 }}
         run: |
           set -euo pipefail
-          test -f tools/among-tools && test ! -L tools/among-tools
+          test -f tools/among-tools
+          test ! -L tools/among-tools
           test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
           chmod 755 tools/among-tools
       - name: Check and build the plugins
@@ -333,7 +356,8 @@ jobs:
           EXPECTED: ${{ needs['tools-amd64'].outputs.sha256 }}
         run: |
           set -euo pipefail
-          test -f tools/among-tools && test ! -L tools/among-tools
+          test -f tools/among-tools
+          test ! -L tools/among-tools
           test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
           chmod 755 tools/among-tools
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -363,6 +387,9 @@ jobs:
           # previous release and carries the others over from it.
           previous=()
           if [ -n "$CARRY_TAG" ]; then
+            # A stable tag whose release candidates exist is published from a
+            # candidate's bytes, not prepared anew.
+            tools/among-tools check-stable-release "$GITHUB_REPOSITORY" "$CARRY_TAG"
             tools/among-tools previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
             if [ -f previous/release.json ]; then
               previous=(--previous previous/catalogue.json previous/release.json)
@@ -411,7 +438,8 @@ jobs:
           EXPECTED: ${{ needs['tools-amd64'].outputs.sha256 }}
         run: |
           set -euo pipefail
-          test -f tools/among-tools && test ! -L tools/among-tools
+          test -f tools/among-tools
+          test ! -L tools/among-tools
           test "$(sha256sum tools/among-tools | cut -d' ' -f1)" = "$EXPECTED"
           chmod 755 tools/among-tools
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -481,6 +509,9 @@ jobs:
           # stops. A stable release made from a release candidate is none of
           # this: it must be the candidate's bytes, checked below.
           previous=()
+          # A stable tag that has release candidates needs candidate-tag, and
+          # one of its own candidates.
+          "$tool" check-stable-release "$GITHUB_REPOSITORY" "$TAG" "$CANDIDATE_TAG"
           if [ -z "$CANDIDATE_TAG" ]; then
             "$tool" previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
             if [ -f previous/release.json ]; then
@@ -501,6 +532,9 @@ jobs:
             # The stable release is the candidate's bytes at the candidate's
             # commit: same assets, same catalogue, same revision.
             "$tool" verify-candidate "$GITHUB_REPOSITORY" "$CANDIDATE_TAG" "$TAG" "$inventory"
+            # Its carried entries are the candidate's; what they point at must
+            # still be published and immutable.
+            "$tool" verify-references "$GITHUB_REPOSITORY" release/assets/among-plugins.json
           elif [ "${#previous[@]}" -gt 0 ]; then
             "$tool" verify-references "$GITHUB_REPOSITORY" release/assets/among-plugins.json \
               previous/catalogue.json "$(jq -r .tag_name previous/release.json)"

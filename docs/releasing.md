@@ -218,10 +218,19 @@ inconsistency. So the stable release is not built again and has no release pull 
 the approved candidate bytes published under the stable tag, which sits on the candidate's
 commit. Packages record the commit in `SOURCE.json`, so a new build would differ.
 
+Because of that, a stable label for which a release candidate tag exists (`v<label>-rc.*`)
+cannot be released anew. `plugin-release-pr`, `plugin-release-plan`, `snapshot-verify`, the
+preparation run and the publication run all refuse it, naming `promote-candidate`; the
+publication run accepts a stable tag with candidates only with `candidate-tag` naming one of
+them (`check-stable-release`). Whether a tag exists is read from the list of matching refs, an
+empty list meaning "no", never from the text of an error.
+
 1. `among-tools promote-candidate Among-Terminal/among-plugins v<label>-rc.N` checks that the
    candidate is a published immutable prerelease, that its tag still resolves to the commit
-   in its release binding, that the stable tag does not exist yet, and lists the unexpired
-   preparation artifacts of that commit. It creates nothing and prints the steps.
+   in its release binding, that this commit is the release commit titled
+   `chore(release): v<label>-rc.N` and that a successful push run of the checks exists for it
+   (the run that verified it strictly), that the stable tag does not exist yet, and lists the
+   unexpired preparation artifacts of that commit. It creates nothing and prints the steps.
 2. The owner creates the tag `v<label>` at that commit (the command prints the `gh api` call).
    No workflow creates it.
 3. The owner runs `Official plugin candidate` on `v<label>` with `publish`, no `prerelease`,
@@ -229,15 +238,19 @@ commit. Packages record the commit in `SOURCE.json`, so a new build would differ
    `candidate-tag=v<label>-rc.N`. The release workflow then publishes those bytes and, before
    it uploads anything, `verify-candidate` requires that the candidate has the same commit in
    its binding and exactly the same assets (names, sizes, SHA-256) as the prepared stable
-   release, and that the candidate's tag still points at that commit. The stable catalogue is
-   the candidate's catalogue, carried entries included, so it is not compared with a previous
-   release again.
+   release, that the candidate's tag still points at that commit and that the commit is its
+   verified release commit. The stable catalogue is the candidate's catalogue, carried entries
+   included, so it is not compared with a previous release again; `verify-references` checks
+   that every release it points at is still published and immutable.
 
-The preparation artifact is kept for 30 days (the candidate preparation artifact, see the
-retention in `plugin-release.yml`). If it has expired, the stable release cannot be made from
-the candidate's bytes any more: `promote-candidate` says so, and the options are a new
-candidate and a new approval, or a stable release with other bytes, which the application
-will refuse to treat as the candidate's update. Other short lifetimes: the build records that
+Publishing the stable release from the candidate's bytes needs the candidate's preparation
+artifact, which is kept for 30 days (see the retention in `plugin-release.yml`). If it has
+expired, `promote-candidate` says so and the stable release cannot be made from the
+candidate's bytes this way: the options are a new candidate and a new approval, or a stable
+release with other bytes, which the application will refuse to treat as the candidate's update.
+Future work, not done here: rebuild the publication inventory from the candidate's published
+assets (they are immutable and their digests are known), which would remove the 30-day limit.
+Other short lifetimes: the build records that
 `plugin-release-pr` reads (`plugin-version-builds-*`) are kept for 14 days, so a release pull
 request is made from a `main` run that is not older than that.
 

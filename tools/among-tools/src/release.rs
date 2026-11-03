@@ -383,12 +383,141 @@ fn read_builds(paths: &[&Path]) -> Result<Vec<Value>> {
 pub fn run_plan(arguments: &PlanArguments) -> Result<Plan> {
     // Without --rc the release is stable and is compared with the last stable one.
     let (tag, bytes) = fetch_previous(arguments.repository, None, arguments.candidate.is_none())?;
-    plan_against(
+    let plan = plan_against(
         arguments.root,
         tag.as_deref(),
         &serde_json::from_slice(&bytes)?,
         &read_builds(arguments.builds)?,
         arguments.candidate,
+    )?;
+    // A stable label whose candidates exist is made from one of them.
+    refuse_stable_after_candidates(
+        &plan.label,
+        &candidate_tags(arguments.repository, &plan.label)?,
+    )?;
+    Ok(plan)
+}
+
+// The tags that start with `prefix`, from the matching-refs list (an empty list
+// is an answer, an error is an error; nothing is read from error text).
+fn matching_tags(repository: &str, prefix: &str) -> Result<Vec<String>> {
+    let refs = release_json(
+        repository,
+        &format!("git/matching-refs/tags/{prefix}?per_page=100"),
+    )?;
+    let list = refs.as_array().ok_or("matching refs are not a list")?;
+    if list.len() >= 100 {
+        return Err(format!("100 or more tags start with {prefix}").into());
+    }
+    list.iter()
+        .map(|entry| {
+            entry["ref"]
+                .as_str()
+                .and_then(|name| name.strip_prefix("refs/tags/"))
+                .map(str::to_owned)
+                .ok_or_else(|| "a matching ref has no tag name".into())
+        })
+        .collect()
+}
+
+fn tag_exists(repository: &str, tag: &str) -> Result<bool> {
+    Ok(matching_tags(repository, tag)?
+        .iter()
+        .any(|found| found == tag))
+}
+
+// The release candidate tags of a stable label: `v0.2.0-rc.1`, `v0.2.0-rc.2`...
+fn candidate_tags(repository: &str, stable: &str) -> Result<Vec<String>> {
+    if stable.contains('-') {
+        return Ok(Vec::new());
+    }
+    Ok(matching_tags(repository, &format!("{stable}-rc."))?
+        .into_iter()
+        .filter(|tag| stable_label(tag).is_ok_and(|label| label == stable))
+        .collect())
+}
+
+// A stable release whose release candidates exist is not prepared, planned or
+// published as a new release: the application treats the same version with
+// other bytes as a publisher inconsistency. It is the candidate's bytes.
+pub(crate) fn refuse_stable_after_candidates(label: &str, candidates: &[String]) -> Result<()> {
+    if label.contains('-') || candidates.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} has release candidates ({}): make the stable release from one with `promote-candidate`",
+        candidates.join(", ")
+    )
+    .into())
+}
+
+// What may be published under `tag`: a candidate or a tag without candidates
+// freely, a stable tag that has candidates only from one of them.
+pub(crate) fn check_stable_publication(
+    tag: &str,
+    candidates: &[String],
+    candidate_input: Option<&str>,
+) -> Result<()> {
+    match candidate_input {
+        None => refuse_stable_after_candidates(tag, candidates),
+        Some(chosen) if candidates.iter().any(|known| known == chosen) => Ok(()),
+        Some(chosen) => Err(format!("{chosen} is not a release candidate of {tag}").into()),
+    }
+}
+
+// `check-stable-release`: the workflow's guard before it prepares or publishes.
+pub fn run_check_stable(repository: &str, tag: &str, candidate: Option<&str>) -> Result<()> {
+    valid_repository(repository)?;
+    if !catalogue::tag_name(tag) {
+        return Err(format!("`{tag}` is not a usable tag name").into());
+    }
+    check_stable_publication(tag, &candidate_tags(repository, tag)?, candidate)
+}
+
+// The release commit of a candidate: titled `chore(release): <candidate tag>`
+// (with the pull request number a squash adds), and checked by a successful
+// push run of the repository's checks, which verified it strictly.
+pub(crate) fn check_candidate_commit(
+    message: &str,
+    runs: &Value,
+    candidate_tag: &str,
+) -> Result<()> {
+    let subject = message.lines().next().unwrap_or_default();
+    let subject = subject
+        .split_once(" (#")
+        .map_or(subject, |(title, _)| title);
+    if subject != format!("chore(release): {candidate_tag}") {
+        return Err(format!(
+            "the commit of {candidate_tag} is not its release commit (its title is `{subject}`)"
+        )
+        .into());
+    }
+    let verified = runs["workflow_runs"].as_array().is_some_and(|all| {
+        all.iter().any(|run| {
+            run["name"] == "Locked Rust source checks"
+                && run["event"] == "push"
+                && run["conclusion"] == "success"
+        })
+    });
+    if !verified {
+        return Err(format!(
+            "no successful push run of the checks exists for the commit of {candidate_tag}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_candidate_commit(repository: &str, commit: &str, candidate_tag: &str) -> Result<()> {
+    let record = release_json(repository, &format!("commits/{commit}"))?;
+    let runs = release_json(
+        repository,
+        &format!("actions/runs?head_sha={commit}&per_page=100"),
+    )?;
+    check_candidate_commit(
+        record["commit"]["message"].as_str().unwrap_or_default(),
+        &runs,
+        candidate_tag,
     )
 }
 
@@ -611,6 +740,7 @@ fn publish_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
 // the computed next label. It returns the label to tag.
 pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Result<String> {
     let label = release_commit_label(root)?;
+    refuse_stable_after_candidates(&label, &candidate_tags(repository, &label)?)?;
     // A stable release is compared with the last stable one, a candidate with
     // the newest release of any kind.
     let (tag, bytes) = fetch_previous(repository, Some(&label), !label.contains('-'))?;
@@ -977,6 +1107,7 @@ pub fn run_verify_candidate(
     if resolved["commit"].as_str() != Some(inventory.revision.as_str()) {
         return Err(format!("{candidate_tag} no longer points at {}", inventory.revision).into());
     }
+    require_candidate_commit(repository, &inventory.revision, candidate_tag)?;
     println!("{stable_tag} is {candidate_tag}: same commit, same assets");
     Ok(())
 }
@@ -1016,10 +1147,8 @@ fn promotion_text(
 pub fn run_promote(repository: &str, candidate_tag: &str) -> Result<()> {
     valid_repository(repository)?;
     let stable = stable_label(candidate_tag)?;
-    match release_json(repository, &format!("git/ref/tags/{stable}")) {
-        Ok(_) => return Err(format!("the tag {stable} already exists").into()),
-        Err(error) if error.to_string().contains("HTTP 404") => {}
-        Err(error) => return Err(error),
+    if tag_exists(repository, &stable)? {
+        return Err(format!("the tag {stable} already exists").into());
     }
     let release = release_json(repository, &format!("releases/tags/{candidate_tag}"))?;
     if release["tag_name"].as_str() != Some(candidate_tag)
@@ -1038,6 +1167,7 @@ pub fn run_promote(repository: &str, candidate_tag: &str) -> Result<()> {
     if resolved["commit"].as_str() != Some(binding.commit.as_str()) {
         return Err(format!("{candidate_tag} does not point at {}", binding.commit).into());
     }
+    require_candidate_commit(repository, &binding.commit, candidate_tag)?;
     let artifacts = release_json(
         repository,
         &format!(
@@ -1137,6 +1267,43 @@ pub(crate) fn check_references(
         referenced.insert(found);
     }
     Ok(referenced)
+}
+
+// Every release a catalogue points at, as a set of (id, tag).
+fn catalogue_references(catalogue: &Value) -> Result<BTreeSet<(u64, String)>> {
+    let mut referenced = BTreeSet::new();
+    for plugin in catalogue["plugins"]
+        .as_array()
+        .ok_or("catalogue has no plugins")?
+    {
+        for version in plugin["versions"].as_array().into_iter().flatten() {
+            if let Some(found) = reference(version)? {
+                referenced.insert(found);
+            }
+        }
+    }
+    Ok(referenced)
+}
+
+// `verify-references <owner/name> <catalogue.json>`: without a previous
+// catalogue to compare with (a stable release made from a candidate's bytes),
+// the carried entries are not re-derived, but every release they point at must
+// still be published and immutable.
+pub fn run_verify_catalogue_references(repository: &str, catalogue: &Path) -> Result<()> {
+    valid_repository(repository)?;
+    let referenced = catalogue_references(&read_json(catalogue)?)?;
+    for (id, tag) in &referenced {
+        check_release(
+            &release_json(repository, &format!("releases/{id}"))?,
+            *id,
+            tag,
+        )?;
+    }
+    println!(
+        "{} release(s) referenced, all published and immutable",
+        referenced.len()
+    );
+    Ok(())
 }
 
 // `verify-references`: the catalogue's carried entries are the previous
@@ -1882,6 +2049,77 @@ mod tests {
             &stable_inventory(&commit, &digest)
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_stable_label_with_release_candidates_is_made_from_one_of_them() {
+        let candidates = ["v0.2.0-rc.1".to_owned(), "v0.2.0-rc.2".to_owned()];
+        // Planning, preparing or publishing a stable release anew is refused,
+        // and the message names the way out.
+        let error = refuse_stable_after_candidates("v0.2.0", &candidates)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("promote-candidate"), "{error}");
+        assert!(error.contains("v0.2.0-rc.1, v0.2.0-rc.2"), "{error}");
+        // No candidates, or a candidate label itself: nothing to refuse.
+        assert!(refuse_stable_after_candidates("v0.2.0", &[]).is_ok());
+        assert!(refuse_stable_after_candidates("v0.2.0-rc.3", &candidates).is_ok());
+        // Publishing: a stable tag with candidates needs a candidate of that tag.
+        assert!(check_stable_publication("v0.2.0", &candidates, None).is_err());
+        assert!(check_stable_publication("v0.2.0", &candidates, Some("v0.2.0-rc.2")).is_ok());
+        assert!(check_stable_publication("v0.2.0", &candidates, Some("v0.2.0-rc.9")).is_err());
+        assert!(check_stable_publication("v0.2.0", &[], None).is_ok());
+        assert!(check_stable_publication("v0.2.0", &[], Some("v0.2.0-rc.1")).is_err());
+        assert!(check_stable_publication("v0.2.0-rc.4", &candidates, None).is_ok());
+    }
+
+    #[test]
+    fn the_commit_of_a_candidate_is_its_verified_release_commit() {
+        let run = |name: &str, event: &str, conclusion: &str| json!({"workflow_runs": [{"name": name, "event": event, "conclusion": conclusion}]});
+        let passed = run("Locked Rust source checks", "push", "success");
+        let title = "chore(release): v0.2.0-rc.1";
+        assert!(check_candidate_commit(title, &passed, "v0.2.0-rc.1").is_ok());
+        // A squash commit carries the pull request number and a body.
+        assert!(check_candidate_commit(
+            "chore(release): v0.2.0-rc.1 (#18)\n\nbody",
+            &passed,
+            "v0.2.0-rc.1"
+        )
+        .is_ok());
+        // Another title, another candidate's title, an ordinary commit.
+        for other in [
+            "feat: x",
+            "chore(release): v0.2.0-rc.2",
+            "chore(release): v0.2.0",
+        ] {
+            assert!(
+                check_candidate_commit(other, &passed, "v0.2.0-rc.1").is_err(),
+                "{other}"
+            );
+        }
+        // The checks must have passed on a push, not failed, not run elsewhere.
+        for bad in [
+            run("Locked Rust source checks", "push", "failure"),
+            run("Locked Rust source checks", "pull_request", "success"),
+            run("Other", "push", "success"),
+            json!({"workflow_runs": []}),
+        ] {
+            assert!(check_candidate_commit(title, &bad, "v0.2.0-rc.1").is_err());
+        }
+    }
+
+    #[test]
+    fn a_catalogue_lists_the_releases_it_points_at() {
+        let mut catalogue = catalogue_of(&[("clock", "0.2.0", "a"), ("pane-pwd", "0.2.0", "b")]);
+        assert!(catalogue_references(&catalogue).unwrap().is_empty());
+        catalogue["plugins"][0]["versions"][0]["release"] = json!({"id": 7, "tag": "v0.1.0"});
+        catalogue["plugins"][1]["versions"][0]["release"] = json!({"id": 7, "tag": "v0.1.0"});
+        assert_eq!(
+            catalogue_references(&catalogue).unwrap(),
+            BTreeSet::from([(7, "v0.1.0".to_owned())])
+        );
+        catalogue["plugins"][1]["versions"][0]["release"] = json!({"id": "7"});
+        assert!(catalogue_references(&catalogue).is_err());
     }
 
     #[test]
