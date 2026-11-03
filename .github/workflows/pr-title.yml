@@ -1,0 +1,37 @@
+name: PR title
+
+# The squash-merge commit takes the pull request title, and the release tooling
+# reads that commit to decide the next version, so the title must be a
+# Conventional Commit. The job always runs (no path filters) so that it can be a
+# required check.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate the title as a Conventional Commit
+        env:
+          # Passed through the environment, never interpolated into the script,
+          # so a hostile title cannot inject shell code.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|docs|test|ci|build|perf|refactor|chore)(\([A-Za-z0-9._/-]+\))?!?: [^[:space:]].*$'
+          # The title is never printed: the runner parses workflow commands
+          # (such as ##[error]) anywhere in a log line, so an echoed title could
+          # forge annotations.
+          if [[ "$PR_TITLE" =~ $pattern ]]; then
+            echo "Title accepted."
+          else
+            {
+              echo "::error title=Invalid pull request title::The title must look like 'type(scope): summary'."
+              echo "Allowed types: feat, fix, docs, test, ci, build, perf, refactor, chore."
+              echo "The scope is optional; '!' before the colon marks a breaking change."
+            } >&2
+            exit 1
+          fi
