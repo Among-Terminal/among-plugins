@@ -381,3 +381,53 @@ schema2 publication follows the exact-byte preparation procedure linked above.
 
 The catalogue generator is read-only toward GitHub. It cannot create, upload,
 publish, mutate tags, install plugins, grant permissions or enable processes.
+
+## Default branch protection
+
+The ruleset of the default branch is kept in
+[`.github/rulesets/main.json`](../.github/rulesets/main.json) so that a change to it
+is reviewed like code. The file is the intended state; GitHub holds the active copy.
+
+- Pull requests merge by squash only, so the pull request title becomes the commit
+  subject. The `pr-title` check rejects a title that is not a Conventional Commit
+  (`feat`, `fix`, `docs`, `test`, `ci`, `build`, `perf`, `refactor`, `chore`, an
+  optional `(scope)`, and `!` before the colon for a breaking change).
+- Every required check is a job that runs on every pull request. `checks.yml` has no
+  path filter, so a documentation-only pull request runs and passes the same jobs.
+  Do not require a check that a path filter, an `if:` condition or a fork can skip:
+  a check that never reports leaves the pull request pending forever. For the same
+  reason the jobs of the nested `release-workflow-check` call are not required; they
+  are skipped outside `Among-Terminal/among-plugins`.
+- The up-to-date requirement (`strict_required_status_checks_policy`) is off, so
+  parallel pull requests do not force each other to rebase.
+- Required check names are the exact job names, including the matrix values. Renaming
+  a job or changing a matrix key of `native`, `packager-regression` or `author-packages`
+  therefore also changes the ruleset in the same pull request.
+
+Applying the file is an owner action. `pr-title` must be added last: a pull request that
+was opened before the `pr-title` workflow reached the default branch never reports that
+check, so requiring it earlier would leave those pull requests pending forever. The order
+is:
+
+1. Merge the pull request that adds the `pr-title` workflow.
+2. Send a new event to every open pull request (push a commit, or close and reopen it), so
+   that each one reports `pr-title`.
+3. Only then put `pr-title` into the live ruleset, by applying the file.
+
+```sh
+gh api -X PUT repos/Among-Terminal/among-plugins/rulesets/25731537 --input .github/rulesets/main.json
+gh api repos/Among-Terminal/among-plugins/rulesets/25731537 |
+  jq -S '{name,target,enforcement,conditions,bypass_actors,rules}' |
+  diff - <(jq -S . .github/rulesets/main.json) && echo "ruleset matches the file"
+```
+
+To revert a ruleset change, apply the previous version of the file from Git history in the
+same way (`git show <commit>:.github/rulesets/main.json | gh api -X PUT ... --input -`). Do
+not edit the live ruleset by hand: the file is the record, and a hand edit leaves it wrong.
+
+Release tags are protected by a separate ruleset,
+[`.github/rulesets/tags.json`](../.github/rulesets/tags.json): tags matching `v*` cannot be
+updated (moved) or deleted, so a published release keeps pointing at the commit its
+catalogue names. Creating a tag stays allowed. It is created once with
+`gh api -X POST repos/Among-Terminal/among-plugins/rulesets --input .github/rulesets/tags.json`
+and is not applied by this change.
