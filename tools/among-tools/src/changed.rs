@@ -312,7 +312,12 @@ fn compare(
     };
     for (id, now) in current {
         let Some(before) = previous.get(id) else {
-            verdict(true, id, format!("new plugin at {}", now.version));
+            // A new plugin has nothing to be compared with, but its version
+            // must still be one the later checks can read.
+            match Version::parse(&now.version) {
+                Ok(_) => verdict(true, id, format!("new plugin at {}", now.version)),
+                Err(error) => verdict(false, id, error.to_string()),
+            }
             continue;
         };
         let (old, new) = match (
@@ -424,12 +429,13 @@ pub fn run(previous: &Path, builds: &[&Path], pending: bool) -> Result<()> {
 // The newest published release, a prerelease included, whose assets contain a
 // catalogue. A prerelease counts because its bytes are already out: the host
 // refuses the same version with different bytes. Drafts are not published and
-// are skipped. Among the candidates of one page the newest is the one with the
-// latest `published_at` (an ISO 8601 UTC time, so text order is time order),
-// ties broken by the larger release id; the order GitHub lists them in is not
-// relied on.
-fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
-    let mut best: Option<(String, u64, String)> = None;
+// are skipped. The newest is the one with the latest `published_at` (an ISO 8601
+// UTC time, so text order is time order), ties broken by the larger release id;
+// the order GitHub lists them in is not relied on.
+type Candidate = (String, u64, String);
+
+fn best_with_catalogue(releases: &Value) -> Result<Option<Candidate>> {
+    let mut best: Option<Candidate> = None;
     for release in releases.as_array().ok_or("release list is not an array")? {
         if release["draft"]
             .as_bool()
@@ -457,16 +463,24 @@ fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
             best = Some(key);
         }
     }
-    Ok(best.map(|(_, _, tag)| tag))
+    Ok(best)
 }
 
-// The most pages of 100 releases that are read looking for a catalogue. A
-// repository with more releases than this and none with a catalogue in them is
-// reported instead of being treated as having no previous release.
+#[cfg(test)]
+fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
+    Ok(best_with_catalogue(releases)?.map(|(_, _, tag)| tag))
+}
+
+// The most pages of 100 releases that are read. Every page is read, because
+// GitHub documents no order for the list and the newest release with a
+// catalogue can be on any of them; a list longer than this is reported, not
+// cut off, since the newest might be beyond the cut.
 const MAX_RELEASE_PAGES: u32 = 20;
 
-// Reads release pages until one holds a published release with a catalogue.
+// Reads the release pages up to the empty one and returns the newest release
+// with a catalogue among all of them.
 fn newest_across_pages(mut page: impl FnMut(u32) -> Result<Value>) -> Result<Option<String>> {
+    let mut best: Option<Candidate> = None;
     for number in 1..=MAX_RELEASE_PAGES {
         let releases = page(number)?;
         if releases
@@ -474,13 +488,18 @@ fn newest_across_pages(mut page: impl FnMut(u32) -> Result<Value>) -> Result<Opt
             .ok_or("release list is not an array")?
             .is_empty()
         {
-            return Ok(None);
+            return Ok(best.map(|(_, _, tag)| tag));
         }
-        if let Some(tag) = newest_with_catalogue(&releases)? {
-            return Ok(Some(tag));
+        if let Some(found) = best_with_catalogue(&releases)? {
+            if best
+                .as_ref()
+                .is_none_or(|known| (&found.0, found.1) > (&known.0, known.1))
+            {
+                best = Some(found);
+            }
         }
     }
-    Err(format!("no release with a catalogue in the newest {MAX_RELEASE_PAGES} pages").into())
+    Err(format!("the release list is longer than {MAX_RELEASE_PAGES} pages").into())
 }
 
 pub(crate) fn valid_repository(repository: &str) -> Result<()> {
@@ -729,6 +748,12 @@ mod tests {
         let report = verdict(&empty, &build("0.1.0", "bin-a", "c", "r"));
         assert_eq!(report.failures, 0);
         assert!(report.lines[0].contains("new plugin at 0.1.0"));
+        // A new plugin's version must still be a semantic version.
+        for bad in ["0.1", "1", "v0.1.0", "0.1.0+build", "01.0.0"] {
+            let report = verdict(&empty, &build(bad, "bin-a", "c", "r"));
+            assert_eq!(report.failures, 1, "{bad}: {:?}", report.lines);
+            assert!(report.lines[0].starts_with("FAIL"), "{bad}");
+        }
 
         let mut other = build("0.1.0", "bin-a", "c", "r");
         other["packages"][0]["manifest"]["id"] = json!("pwd");
@@ -911,25 +936,49 @@ mod tests {
     }
 
     #[test]
-    fn pages_are_read_until_a_release_with_a_catalogue_is_found() {
+    fn every_page_is_read_and_the_newest_catalogue_release_wins_wherever_it_is() {
         let plain = |tag: &str| {
             json!({"tag_name": tag, "id": 1, "published_at": "2026-01-01T00:00:00Z",
                    "draft": false, "assets": [{"name": "other.json"}]})
         };
-        let with = json!({"tag_name": "v0.2.0", "id": 2, "published_at": "2026-02-01T00:00:00Z",
-                          "draft": false, "assets": [{"name": CATALOGUE_ASSET}]});
+        let with = |tag: &str, id: u64, at: &str| {
+            json!({"tag_name": tag, "id": id, "published_at": at,
+                   "draft": false, "assets": [{"name": CATALOGUE_ASSET}]})
+        };
+        // A release with a catalogue on page 1 is older than one on page 3.
         let mut asked = Vec::new();
         let found = newest_across_pages(|number| {
             asked.push(number);
             Ok(match number {
-                1 => json!([plain("a"), plain("b")]),
-                2 => json!([plain("c"), with.clone()]),
-                _ => panic!("read past the page that has a catalogue"),
+                1 => json!([plain("a"), with("v0.1.0", 2, "2026-02-01T00:00:00Z")]),
+                2 => json!([plain("c")]),
+                3 => json!([with("v0.3.0", 4, "2026-04-01T00:00:00Z"), plain("d")]),
+                _ => json!([]),
             })
         })
         .unwrap();
-        assert_eq!(found.as_deref(), Some("v0.2.0"));
-        assert_eq!(asked, [1, 2]);
+        assert_eq!(found.as_deref(), Some("v0.3.0"));
+        assert_eq!(asked, [1, 2, 3, 4]);
+        // The other way round: the newer one is on the first page.
+        let found = newest_across_pages(|number| {
+            Ok(match number {
+                1 => json!([with("v0.3.0", 4, "2026-04-01T00:00:00Z")]),
+                2 => json!([with("v0.1.0", 2, "2026-02-01T00:00:00Z")]),
+                _ => json!([]),
+            })
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("v0.3.0"));
+        // The same instant on two pages: the larger release id.
+        let found = newest_across_pages(|number| {
+            Ok(match number {
+                1 => json!([with("a", 4, "2026-04-01T00:00:00Z")]),
+                2 => json!([with("b", 9, "2026-04-01T00:00:00Z")]),
+                _ => json!([]),
+            })
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("b"));
         // An empty page is the end of the list.
         assert_eq!(
             newest_across_pages(|n| Ok(if n == 1 {
@@ -940,7 +989,7 @@ mod tests {
             .unwrap(),
             None
         );
-        // Endless pages without a catalogue are an error, not "no release".
+        // A list that never ends is an error, not "no release" and not a guess.
         assert!(newest_across_pages(|_| Ok(json!([plain("a")]))).is_err());
         assert!(newest_across_pages(|_| Err("network".into())).is_err());
     }

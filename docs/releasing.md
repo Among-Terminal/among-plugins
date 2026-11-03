@@ -64,22 +64,24 @@ members differed.
 
 The previous release is the newest published release, a prerelease included, that has an
 `among-plugins.json` asset; drafts are skipped. "Newest" is the latest `published_at`
-(ties go to the larger release id), not the order GitHub lists them in, and release pages
-are read, 100 at a time, until a release with a catalogue turns up. A prerelease counts
-because its bytes are already out. When no release has a catalogue, every plugin counts as
+(ties go to the larger release id), not the order GitHub lists them in, and all release
+pages are read, 100 at a time, up to the empty one (a list longer than 20 pages is an error,
+because the newest release could be beyond the cut). A prerelease counts because its bytes
+are already out. When no release has a catalogue, every plugin counts as
 new and the check passes. `checks.yml` runs it on every pull request, after packaging, and
 further steps prove on the real build that unchanged content passes, that a changed
 executable without a version raise fails, and that a version raise over unchanged content
 fails with the reason `packaged content is unchanged`.
 
 There are two modes. The default is strict: changed content must come with a raised
-version. An ordinary pull request does not raise versions (the release pull request does,
-once, for every plugin that changed), so `checks.yml` runs `--pending` for it: changed
-content at the previous version passes, while a raise without a change or a lower version
-still fails. The run is strict for a release: a branch `release/<label>`, a pull request
-titled `chore(release): ...`, or a push to the default branch whose commit title starts
-that way. A title is only a hint, so the release commit is verified again before it is
-tagged.
+version. An ordinary pull request does not raise versions (they are raised together, once,
+for every plugin that changed, in a release change), so `checks.yml` runs `--pending` for it:
+changed content at the previous version passes, while a raise without a change or a lower
+version still fails. The run is strict for a release change, which `checks.yml` recognises
+by a branch `release/<label>`, a pull request titled `chore(release): ...`, or a push to the
+default branch whose commit title starts that way. The recognition looks at names and
+titles only; this check is the only thing the change adds, and it creates no tag or release.
+A new plugin has nothing to be compared with, but its version must be a semantic version.
 
 ```sh
 among-tools previous-catalogue Among-Terminal/among-plugins previous-catalogue.json
