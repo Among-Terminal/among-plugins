@@ -34,13 +34,13 @@ tags such as `clock/v1.2.3`: the application reads the repository's latest relea
 catalogue describes only that release, and the release workflows accept only tags of the
 form `v[A-Za-z0-9._-]`.
 
-Known limitation. Rebuilding an unchanged plugin for a new tag gives the same content but
-not the same archive: the package records the source commit in `SOURCE.json`, and the
-catalogue names the tag's commit as the version's `revision`. The application treats the
-same version with another package digest or another revision as a publisher
-inconsistency and offers no update for it. Raising a version only for that reason is
-refused by the check below, so this needs a decision about packaging before the second
-snapshot is published.
+An unchanged plugin is not rebuilt or shipped again. Rebuilding it for a new tag would give
+the same content but not the same archive (the package records the source commit in
+`SOURCE.json`, and the catalogue names the tag's commit as the version's `revision`), and
+the application treats the same version with another package digest or another revision
+as a publisher inconsistency. Instead, the new catalogue carries the plugin's previous
+entry over verbatim, with a `release` reference to the immutable release that holds its
+files (see [Carrying unchanged plugins over](#carrying-unchanged-plugins-over)).
 
 ### Checking versions against the previous release
 
@@ -89,29 +89,208 @@ among-tools changed-plugins --pending previous-catalogue.json dist/author-amd64/
 among-tools changed-plugins previous-catalogue.json dist/author-amd64/build.json dist/author-arm64/build.json
 ```
 
-When a version rose without a content change, or fell, revert the version.
+When it fails because a version rose without a change or fell, revert the version.
 
-### Release candidates
+### The release pull request
+
+The release pull request raises the versions. It is opened by a command with the operator's
+own credentials, so the ordinary required checks run on it (a pull request opened by the
+workflow token would not start them). No bot opens pull requests.
+
+1. On a clean `main` that equals `origin/main`, take the build records of that commit:
+   the `plugin-version-builds-<arch>-<sha>` artifacts of its `Locked Rust source checks`
+   run (`build.json` from `author-packages`, the packaging a release uses). Their
+   `revision` must be the checked out commit; the tool refuses any other.
+2. Run `among-tools plugin-release-pr . Among-Terminal/among-plugins [--rc N] [--dry-run]
+   amd64/build.json arm64/build.json`. It fetches the previous release itself (so its tag
+   and its catalogue come from the same release), prints the plan, and without `--dry-run`
+   creates the branch `release/<label>`, raises the manifests, commits
+   `chore(release): <label>`, pushes and opens the pull request. It refuses when the label
+   is already a tag, locally or on the remote. If the commit or the push fails, it puts the
+   working tree back on `main` and deletes the branch. Once the push has succeeded the branch
+   is kept, locally and on origin (deleting the local copy would make a retry a
+   non-fast-forward push); if only opening the pull request fails, the error says that the
+   branch exists and gives the `gh pr create` call to continue with, or tells to delete the
+   branch in both places and run the command again. `plugin-release-plan` prints the same plan as
+   JSON and touches nothing.
+
+How the plan is made:
+
+- A plugin is changed when its packaged content differs from the previous release (the rules
+  above); a new plugin is not bumped.
+- The level comes from the Conventional Commit titles since the previous tag. For a plugin
+  they are the commits scoped with its id and the commits whose scope names no plugin (shared
+  code, no scope); a commit scoped to another plugin does not count. `feat` raises the minor
+  version, `fix` and `perf` the patch version, and `!` before the colon or a line starting
+  with `BREAKING CHANGE:` in the commit body the major version, but while the major version
+  is zero a breaking change raises the minor one. The body footer counts only when it is in
+  the commit message that lands on `main`; a squash commit takes it from the pull request
+  description. A changed plugin without such a commit gets a patch. Other types (`docs`,
+  `test`, `ci`, `build`, `refactor`, `chore`) do not count.
+- The snapshot label is the previous tag raised by the largest level among the changed plugins.
+  The first release is `v0.2.0`. If the previous tag is a candidate, the label stays and only
+  `--rc` moves the candidate number. `--rc N` appends `-rc.N`.
+
+Merging the pull request is the owner's decision. The `Snapshot tag` workflow then runs after
+the `Locked Rust source checks` of the merge commit have passed, and only for a push to `main`
+whose title is `chore(release): ...`. The commit title is not trusted. The verifying tool is
+built from the parent of the release commit, never from the commit it judges. Before the
+workflow creates anything it checks, with `snapshot-verify`:
+
+- the commit changes nothing but plugin manifests, and each manifest differs from its
+  parent's only in `version` (parsed JSON of both, compared without `version`, so layout and key
+  order do not count and any other key or value does);
+- the build records are those of this very commit, built by the checks run that just passed;
+- the strict version check passes against the previous release as it is now: every changed
+  plugin carries a raised version, no version rose without a change;
+- each raised version equals the bump the commits since the previous release call for (the
+  plan computes it again from the old version and the commits, and refuses any other), and the
+  label in the title is the next label computed from them.
+
+The previous release is the last stable release for a stable label and the newest release of
+any kind for a candidate label (see below).
+
+Only then it creates the single tag `v<label>` on the commit, with the workflow token. An
+existing tag at the same commit is confirmed, a tag anywhere else fails the run, and a tag is
+never moved. A tag created this way starts no `push` workflow, and this workflow starts none:
+the preparation and the publication stay manual runs of `Official plugin candidate` on the
+tag. (The workflow does not dispatch it, because the pinned release workflow of that file
+does not carry unchanged plugins over yet; raising that pin to a commit that does is a
+separate change.) If another release is published between the checks and the tag job, the
+check against "the previous release as it is now" fails and no tag is made; the release pull
+request is then rebuilt on the new state.
+
+### Carrying unchanged plugins over
+
+A plugin that did not change is not rebuilt or shipped again; see above for why. In a run
+for a release tag the release workflow fetches the previous release with `previous-release`
+(a catalogue and a record of the release) and passes it to `author-catalogue --previous`:
+
+- a plugin whose version and packaged content equal the previous release's is left out of
+  the assets, and its catalogue entry is the previous entry, verbatim, with
+  `"release": {"id": <numeric release id>, "tag": "<tag>"}` naming the immutable release that
+  holds its files; an entry that already carries a reference keeps it;
+- the command fails when the previous release is a draft or not immutable, when an unchanged
+  plugin has no entry in the previous catalogue, when content and version disagree, and when
+  nothing changed at all;
+- the asset inventory lists only what is uploaded, so `verify-release` needs no change;
+  `prepared-inventory` accepts a carried entry without its package, refuses one whose package
+  is also shipped, and refuses a release that ships no plugin of its own;
+- `verify-references` then checks that every carried entry equals the previous catalogue's
+  entry apart from the reference, that the reference is the previous entry's own or the
+  previous release, and that every referenced release is published and immutable. The
+  publish job runs it again against the previous release as it is at publication time, so
+  a prepared candidate whose predecessor changed is refused.
+
+A check run on a pull request (not for a release tag) catalogues every plugin, so that it
+passes when nothing changed.
+
+### The first release
+
+The first release of the repository (`v0.2.0`) has no previous release with a catalogue, and
+its manifests already say `0.2.0`, so there is nothing to raise and no `chore(release):`
+commit. Everything else about it is the same: all plugins are new, none is carried over, and
+the stable release is made from a candidate's bytes (see below). Only the commit rule differs:
+
+- for the first release, and only for it, the commit of the candidate may be any commit that
+  is an ancestor of `main` and has a successful push run of `Locked Rust source checks` on
+  `main`;
+- every other release keeps the rule that its commit is titled `chore(release): <tag>`. A
+  second candidate of the first label is not the first release, because the first candidate
+  already is a release with a catalogue, and neither is any candidate while another
+  `v0.2.0-rc.*` tag exists, so deleting a release cannot reopen the exemption.
+
+`among-tools first-release Among-Terminal/among-plugins <commit>` checks that no release with
+a catalogue exists, that no `v0.2.0-rc.*` tag and not `v0.2.0` exists, that the commit is an
+ancestor of `main` (its merge base with `main` is the commit) and that the checks passed on it,
+and prints the steps. It creates nothing. The steps are:
+
+1. The owner creates the tag `v0.2.0-rc.1` at that commit (the command prints the `gh api` call).
+   This is a tag, so it needs the owner's separate decision.
+2. `Official plugin candidate` runs on the tag with `publish` off; the bytes are inspected and
+   the owner approves the exact tag, commit and bytes.
+3. The same workflow publishes the approved bytes with `prerelease` and the prepared inputs.
+4. For the stable release, `promote-candidate` and the steps below apply; for this first
+   release `promote-candidate` and `verify-candidate` accept the commit described above.
+
+### Release candidates and the stable release made from one
 
 A candidate is a prerelease of the same repository with a tag `v<label>-rc.N`. Plugin
 manifests keep the versions they will have in the stable release; the candidate suffix is
 only in the tag.
 
-1. Merge the changes, with the plugin versions raised as the check requires.
-2. Run `Official plugin candidate` with `publish` off on the commit to prepare and inspect
+Which release is "the previous release" depends on the tag being prepared:
+
+- a candidate (`-rc.N`, a hyphen in the tag) is compared with the newest published release of
+  any kind, so that `-rc.2` can ship what changed since `-rc.1` and carry the rest over;
+- a stable tag (no hyphen) is compared with the last stable release. Candidates are never its
+  predecessor: a candidate is the stable release in advance, and compared with it nothing would
+  have changed.
+
+1. Open the release pull request with `--rc N`, so its title is
+   `chore(release): v<label>-rc.N`, and let the owner merge it. The `Snapshot tag` workflow
+   creates the tag `v<label>-rc.N` on the merge commit.
+2. Run `Official plugin candidate` on that tag with `publish` off. It prepares and inspects
    the bytes (see [author-release.md](author-release.md#publishing-approved-preparation-bytes)).
-3. After the owner approves the exact tag and commit, the owner creates the tag
-   `v<label>-rc.N` and runs the workflow with `publish`, `prerelease` and the approved
-   run, artifact and checksum inputs. The release is a prerelease, so the application's
-   latest lookup ignores it.
+3. After the owner approves the exact tag, commit and prepared bytes, the owner runs the
+   workflow with `publish`, `prerelease` and the approved run, artifact and checksum
+   inputs. The release is a prerelease, so the application's latest lookup ignores it.
 4. Install it with the application's development mode (`--plugin-development`, "Use
    latest prerelease" for the repository).
-5. The stable release is the tag `v<label>` on the same commit with the same bytes. A
-   fix after a candidate changes a plugin, so the check requires its version to rise
-   (the candidate is the previous release); then make another candidate (`-rc.N+1`).
 
-Publishing, tagging and the owner's approval are separate steps that no pull request
-performs.
+A fix after a candidate changes a plugin, and the candidate is then the previous release for
+the next candidate, so the next release pull request raises that plugin's version; make
+another candidate (`--rc N+1`).
+
+#### The stable release from a candidate: same commit, same bytes
+
+The application installs a candidate in development mode and offers the stable release of the
+same version as an update only if the manifest digest, the package digest and the commit the
+tag resolves to are the installed ones; anything else is refused as a publisher
+inconsistency. So the stable release is not built again and has no release pull request: it is
+the approved candidate bytes published under the stable tag, which sits on the candidate's
+commit. Packages record the commit in `SOURCE.json`, so a new build would differ.
+
+Because of that, a stable label for which a release candidate tag exists (`v<label>-rc.*`)
+cannot be released anew. `plugin-release-pr`, `plugin-release-plan`, `snapshot-verify`, the
+preparation run and the publication run all refuse it, naming `promote-candidate`; the
+publication run accepts a stable tag with candidates only with `candidate-tag` naming one of
+them (`check-stable-release`). Whether a tag exists is read from the list of matching refs, an
+empty list meaning "no", never from the text of an error.
+
+1. `among-tools promote-candidate Among-Terminal/among-plugins v<label>-rc.N` checks that the
+   candidate is a published immutable prerelease, that its tag still resolves to the commit
+   in its release binding, that this commit is the release commit titled
+   `chore(release): v<label>-rc.N` (for the first release: an ancestor of `main`, see above)
+   and that a successful push run of the checks exists for it on `main` (the run that verified
+   it), that the stable tag does not exist yet, and lists the
+   unexpired preparation artifacts of that commit. It creates nothing and prints the steps.
+2. The owner creates the tag `v<label>` at that commit (the command prints the `gh api` call).
+   No workflow creates it.
+3. The owner runs `Official plugin candidate` on `v<label>` with `publish`, no `prerelease`,
+   the candidate's approved `prepared-sha256sums`, the preparation run and artifact, and
+   `candidate-tag=v<label>-rc.N`. The release workflow then publishes those bytes and, before
+   it uploads anything, `verify-candidate` requires that the candidate has the same commit in
+   its binding and exactly the same assets (names, sizes, SHA-256) as the prepared stable
+   release, that the candidate's tag still points at that commit and that the commit is its
+   verified release commit. The stable catalogue is the candidate's catalogue, carried entries
+   included, so it is not compared with a previous release again; `verify-references` checks
+   that every release it points at is still published and immutable.
+
+Publishing the stable release from the candidate's bytes needs the candidate's preparation
+artifact, which is kept for 30 days (see the retention in `plugin-release.yml`). If it has
+expired, `promote-candidate` says so and the stable release cannot be made from the
+candidate's bytes this way: the options are a new candidate and a new approval, or a stable
+release with other bytes, which the application will refuse to treat as the candidate's update.
+Future work, not done here: rebuild the publication inventory from the candidate's published
+assets (they are immutable and their digests are known), which would remove the 30-day limit.
+Other short lifetimes: the build records that
+`plugin-release-pr` reads (`plugin-version-builds-*`) are kept for 14 days, so a release pull
+request is made from a `main` run that is not older than that.
+
+Publishing and the owner's approval are separate steps that no pull request and no workflow
+here performs; the only tag a workflow creates is the snapshot tag, after the owner has
+merged a release pull request and the commit has been verified again.
 
 ## Native preparation
 
@@ -250,7 +429,9 @@ is reviewed like code. The file is the intended state; GitHub holds the active c
   Do not require a check that a path filter, an `if:` condition or a fork can skip:
   a check that never reports leaves the pull request pending forever. For the same
   reason the jobs of the nested `release-workflow-check` call are not required; they
-  are skipped outside `Among-Terminal/among-plugins`.
+  are skipped outside `Among-Terminal/among-plugins`. The job `workflow-scripts` runs on
+  every pull request but only exists on a branch once the pull request that adds it is
+  merged, so it joins the required checks after that merge, in the order given below.
 - The up-to-date requirement (`strict_required_status_checks_policy`) is off, so
   parallel pull requests do not force each other to rebase.
 - Required check names are the exact job names, including the matrix values. Renaming

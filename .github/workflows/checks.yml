@@ -86,13 +86,23 @@ jobs:
           set -euo pipefail
           tool="$PWD/tools/among-tools/target/debug/among-tools"
           build="dist/author-${{ matrix.architecture }}/build.json"
-          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
-          # An ordinary change leaves the versions to the release change and is
-          # checked as pending: changed content at the previous version passes.
-          # A release change is checked strictly, so every changed plugin must
-          # carry a raised version. It is recognised by its branch, by its pull
-          # request title and by the commit it becomes on the default branch;
-          # names and titles are all this step looks at.
+          # The label of a release, if this is one: a stable label (no hyphen)
+          # is compared with the last stable release, not with its candidates.
+          label=""
+          case "${GITHUB_HEAD_REF:-}" in release/*) label="${GITHUB_HEAD_REF#release/}" ;; esac
+          title="${PULL_REQUEST_TITLE:-$COMMIT_MESSAGE}"
+          title="${title%%$'\n'*}"
+          case "$title" in 'chore(release): '*) label="${title#chore(release): }"; label="${label%% *}" ;; esac
+          baseline=()
+          if [ -n "$label" ] && [ "${label#*-}" = "$label" ]; then baseline=(--stable-only); fi
+          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json" "${baseline[@]}"
+          # An ordinary change leaves the versions to the release pull request
+          # and is checked as pending: changed content at the previous version
+          # passes. The release itself is checked strictly, so every changed
+          # plugin must carry a raised version. A release is recognised by its
+          # branch, by its pull request title and by the commit it becomes on
+          # the default branch; a title is only a hint here, because the
+          # release commit is verified again before it is tagged.
           mode=(--pending)
           case "${GITHUB_HEAD_REF:-}" in release/*) mode=() ;; esac
           case "$PULL_REQUEST_TITLE" in 'chore(release): '*) mode=() ;; esac
@@ -183,7 +193,9 @@ jobs:
           mkdir -m 700 "$root"
           git rev-parse HEAD > "$root/source.txt"
           binary="$PWD/target/debug/system-status-managed"
-          test -f "$binary" && test -x "$binary" && test ! -L "$binary"
+          test -f "$binary"
+          test -x "$binary"
+          test ! -L "$binary"
           sha256sum "$binary" > "$root/binary-sha256.txt"
           # The unchanged full suite above remains mandatory. This additional
           # exact invocation retains successful numeric observations, not a
@@ -393,6 +405,59 @@ jobs:
           printf 'x' >> "resized/$(jq -r '.packages[0].name' arm64/build.json)"
           refuse 'differs from its record' \
             "$tool" author-catalogue amd64 resized 7 v1.0.0 "$revision" resized-out
+          # The same plugins against the release just made: nothing changed, so
+          # there is nothing to release. (Carrying some plugins over while
+          # shipping others is covered by the tool's own tests.)
+          echo '{"id": 41, "tag_name": "v1.0.0", "draft": false, "immutable": true}' > previous-release.json
+          refuse 'no plugin changed since the previous release' \
+            "$tool" author-catalogue amd64 arm64 7 v1.0.1 "$revision" nothing-new \
+            --previous release/assets/among-plugins.json previous-release.json
+          echo '{"id": 41, "tag_name": "v1.0.0", "draft": true, "immutable": false}' > unpublished-release.json
+          refuse 'is not published' \
+            "$tool" author-catalogue amd64 arm64 7 v1.0.1 "$revision" from-draft \
+            --previous release/assets/among-plugins.json unpublished-release.json
+
+  # The scripts of the release workflow that need no network, run from the
+  # workflow file itself (parsed with yq, not copied), so that a refusal that
+  # silently stops working is caught here.
+  workflow-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: The candidate-tag check refuses each wrong condition, and only those
+        run: |
+          set -euo pipefail
+          script=$(yq '.jobs.pin.steps[] | select(.id == "candidate") | .run' .github/workflows/plugin-release.yml)
+          test -n "$script"
+          # A complete valid environment; each case changes one thing.
+          valid=(REF=refs/tags/v0.2.0 PUBLISH=true PREPARED_RUN=7 PRERELEASE=false CANDIDATE_TAG=v0.2.0-rc.1)
+          run_case() {
+            local fragment="$1"; shift
+            local environment=("${valid[@]}" "$@")
+            local status=0
+            env -i PATH="$PATH" "${environment[@]}" bash -c "$script" > /dev/null 2> case.err || status=$?
+            if [ -z "$fragment" ]; then
+              if [ "$status" -ne 0 ]; then echo "refused a valid case: $*"; cat case.err; exit 1; fi
+            else
+              if [ "$status" -eq 0 ]; then echo "accepted: $*"; exit 1; fi
+              grep -F -- "$fragment" case.err || { echo "wrong reason for: $*"; cat case.err; exit 1; }
+            fi
+          }
+          run_case ''
+          run_case '' CANDIDATE_TAG= PUBLISH=false PRERELEASE=true PREPARED_RUN=
+          run_case 'needs publish' PUBLISH=false
+          run_case 'needs the prepared inputs' PREPARED_RUN=
+          run_case 'a stable release is not a prerelease' PRERELEASE=true
+          run_case 'needs a v* tag' REF=refs/heads/main
+          run_case 'needs a stable tag' REF=refs/tags/v0.2.0-rc.1
+          run_case 'is not a candidate of v0.2.0' CANDIDATE_TAG=v0.3.0-rc.1
+          run_case 'is not a candidate of v0.2.0' CANDIDATE_TAG=v0.2.0
+          run_case 'has no candidate number' CANDIDATE_TAG=v0.2.0-rc.0
+          run_case 'has no candidate number' CANDIDATE_TAG=v0.2.0-rc.x
 
   # The release workflow as an author's repository calls it, in check mode:
   # this repository's own plugins are built, packaged and catalogued on both
@@ -401,6 +466,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
+    uses: ./.github/workflows/plugin-release.yml
     with:
       publish: false

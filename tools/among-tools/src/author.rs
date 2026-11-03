@@ -9,8 +9,9 @@
 
 use crate::{
     archive::{self, Member},
+    changed,
     package::{self, Delivery, Runtime},
-    process, strict, toolchain, Result,
+    process, release, strict, toolchain, Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -537,6 +538,10 @@ pub struct Inventory {
 /// `author-catalogue`: the schema 2 catalogue and the complete release asset
 /// set, written to `output/assets`, plus `output/inventory.json`, the exact
 /// snapshot the release is checked against.
+/// `author-catalogue`: with `previous` (the catalogue and the release record of
+/// the previous release) a plugin whose version and packaged content are
+/// unchanged is not shipped again: its package is left out of the assets and
+/// its catalogue entry is the previous one, verbatim, referring to that release.
 pub fn catalogue(
     amd64: &Path,
     arm64: &Path,
@@ -544,8 +549,17 @@ pub fn catalogue(
     tag: &str,
     revision: &str,
     output: &Path,
+    previous: Option<(&Path, &Path)>,
 ) -> Result<()> {
-    catalogue_with(
+    let previous = previous
+        .map(|(catalogue, release)| -> Result<release::Previous> {
+            Ok(release::Previous {
+                catalogue: changed::read_json(catalogue)?,
+                release: changed::read_json(release)?,
+            })
+        })
+        .transpose()?;
+    catalogue_carrying(
         amd64,
         arm64,
         repository_id,
@@ -553,9 +567,11 @@ pub fn catalogue(
         revision,
         output,
         toolchain::verify,
+        previous.as_ref(),
     )
 }
 
+#[cfg(test)]
 fn catalogue_with(
     amd64: &Path,
     arm64: &Path,
@@ -564,6 +580,29 @@ fn catalogue_with(
     revision: &str,
     output: &Path,
     verify_toolchain: ToolchainCheck,
+) -> Result<()> {
+    catalogue_carrying(
+        amd64,
+        arm64,
+        repository_id,
+        tag,
+        revision,
+        output,
+        verify_toolchain,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn catalogue_carrying(
+    amd64: &Path,
+    arm64: &Path,
+    repository_id: u64,
+    tag: &str,
+    revision: &str,
+    output: &Path,
+    verify_toolchain: ToolchainCheck,
+    previous: Option<&release::Previous>,
 ) -> Result<()> {
     if repository_id == 0 || !package::hex(revision, 40) || !crate::catalogue::tag_name(tag) {
         return Err("expected repository ID, revision and tag are malformed".into());
@@ -577,6 +616,21 @@ fn catalogue_with(
     {
         return Err("architectures differ in source delivery, plugin set or manifest bytes".into());
     }
+    let carried: BTreeSet<String> = match previous {
+        Some(previous) => {
+            release::check_previous(previous)?;
+            let records = [
+                changed::read_json(&builds[0].directory.join("build.json"))?,
+                changed::read_json(&builds[1].directory.join("build.json"))?,
+            ];
+            let carried = release::unchanged_in_builds(previous, &records)?;
+            if carried.len() == builds[0].manifests.len() {
+                return Err("no plugin changed since the previous release".into());
+            }
+            carried
+        }
+        None => BTreeSet::new(),
+    };
     let assets = output.join("assets");
     fs::create_dir(output)?;
     fs::create_dir(&assets)?;
@@ -603,7 +657,9 @@ fn catalogue_with(
                 .iter()
                 .find(|package| &package.id == id)
                 .ok_or_else(|| format!("{id} missing on one architecture"))?;
-            copy(&build.directory, &package.name)?;
+            if !carried.contains(id) {
+                copy(&build.directory, &package.name)?;
+            }
             let mut artifact = serde_json::to_value(&package.artifact)?;
             artifact
                 .as_object_mut()
@@ -618,8 +674,11 @@ fn catalogue_with(
             "artifacts": artifacts,
         }]}));
     }
-    let mut catalogue =
-        serde_json::to_vec_pretty(&json!({"schema_version": 2, "plugins": plugins}))?;
+    let mut fresh = json!({"schema_version": 2, "plugins": plugins});
+    if let Some(previous) = previous {
+        fresh = release::carry_over(previous, &fresh, &carried)?;
+    }
+    let mut catalogue = serde_json::to_vec_pretty(&fresh)?;
     catalogue.push(b'\n');
     if catalogue.len() > MAX_CATALOGUE {
         return Err(format!(
@@ -703,7 +762,7 @@ pub fn binding(inventory: &Path, workflow_ref: &str, run_id: u64, output: &Path)
     archive::write_new(output, line.as_bytes())
 }
 
-fn read_inventory(path: &Path) -> Result<Inventory> {
+pub(crate) fn read_inventory(path: &Path) -> Result<Inventory> {
     Ok(serde_json::from_value(strict::parse(&archive::read(
         path,
         1024 * 1024,
@@ -862,6 +921,7 @@ pub fn prepared_inventory(
     );
     let mut referenced = BTreeSet::from([CATALOGUE.to_owned(), SUMS.to_owned(), source_name]);
     let mut ids = BTreeSet::new();
+    let mut shipped = 0;
     for plugin in plugins {
         let id = plugin["id"]
             .as_str()
@@ -872,6 +932,28 @@ pub fn prepared_inventory(
             .filter(|versions| versions.len() == 1)
             .ok_or("prepared plugin requires exactly one version")?;
         let version = &versions[0];
+        if version.get("release").is_some() {
+            // An unchanged plugin carried over from an earlier immutable
+            // release: its files are not part of this release. That its entry
+            // is the earlier one, byte for byte, is checked against the
+            // previous catalogue by `verify-references`.
+            if release::reference(version)?.is_none() {
+                return Err("carried plugin lacks its release reference".into());
+            }
+            if !ids.insert(id) {
+                return Err("prepared catalogue lists a plugin twice".into());
+            }
+            for artifact in version["artifacts"].as_array().into_iter().flatten() {
+                if artifact["asset"]
+                    .as_str()
+                    .is_some_and(|name| expected.contains_key(name))
+                {
+                    return Err("a carried plugin's package is also shipped in this release".into());
+                }
+            }
+            continue;
+        }
+        shipped += 1;
         if !ids.insert(id) || version["revision"] != revision {
             return Err(
                 "prepared catalogue does not bind unique plugins to the approved source".into(),
@@ -922,6 +1004,9 @@ pub fn prepared_inventory(
             }
         }
     }
+    if shipped == 0 {
+        return Err("prepared release ships no plugin of its own".into());
+    }
     if referenced.len() != expected.len() {
         return Err("prepared inventory contains assets outside its catalogue".into());
     }
@@ -929,7 +1014,7 @@ pub fn prepared_inventory(
     archive::json(output, &inventory)
 }
 
-fn body_binding(release: &Value) -> Result<Binding> {
+pub(crate) fn body_binding(release: &Value) -> Result<Binding> {
     let body = release["body"].as_str().unwrap_or_default();
     let mut lines = body
         .lines()
@@ -1723,7 +1808,11 @@ mod build_tests {
     }
 
     fn manifest(id: &str, description: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!({"schema_version":1,"id":id,"version":"1.0.0",
+        manifest_at(id, description, "1.0.0")
+    }
+
+    fn manifest_at(id: &str, description: &str, version: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({"schema_version":1,"id":id,"version":version,
             "name":id,"description":description,"entrypoint":format!("bin/{id}"),
             "api":{"major":1,"minor":2},"required_features":["status"],"optional_features":[]}))
         .unwrap()
@@ -1769,7 +1858,11 @@ mod build_tests {
                     (serde_json::to_vec_pretty(&record).unwrap(), false),
                 ),
             ]);
-            let name = package_name(id, "1.0.0", architecture);
+            let version = serde_json::from_slice::<Value>(manifest).unwrap()["version"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let name = package_name(id, &version, architecture);
             let members = archive::pack(&directory.join(&name), &files).unwrap();
             let bytes = fs::read(directory.join(&name)).unwrap();
             packages.push(Package {
@@ -1856,6 +1949,147 @@ mod build_tests {
         let output = root.join("prepared");
         catalogue_with(&amd64, &arm64, 7, "check", REVISION, &output, accept).unwrap();
         output
+    }
+
+    /// A second snapshot of the same two plugins, where only `beta` changed
+    /// (a new description and version) and `alpha` is byte for byte the same.
+    /// Returns the output of the second catalogue and the previous release.
+    fn second_snapshot(
+        first: &Path,
+        second: &Path,
+        beta_version: &str,
+    ) -> (PathBuf, release::Previous) {
+        let (amd64, arm64) = (
+            build(first, "amd64", &plugins()),
+            build(first, "arm64", &plugins()),
+        );
+        let output = first.join("release");
+        catalogue_with(&amd64, &arm64, 7, "v1.0.0", REVISION, &output, accept).unwrap();
+        let previous = release::Previous {
+            catalogue: changed::read_json(&output.join("assets").join(CATALOGUE)).unwrap(),
+            release: json!({"id": 41, "tag_name": "v1.0.0", "draft": false, "immutable": true}),
+        };
+        let next = vec![
+            ("alpha", manifest("alpha", "first")),
+            ("beta", manifest_at("beta", "second, changed", beta_version)),
+        ];
+        let (amd64, arm64) = (build(second, "amd64", &next), build(second, "arm64", &next));
+        let output = second.join("release");
+        catalogue_carrying(
+            &amd64,
+            &arm64,
+            7,
+            "v1.1.0",
+            REVISION,
+            &output,
+            accept,
+            Some(&previous),
+        )
+        .unwrap();
+        (output, previous)
+    }
+
+    #[test]
+    fn an_unchanged_plugin_is_carried_over_and_its_package_is_not_shipped_again() {
+        let (first, second) = (Scratch::new("carry-first"), Scratch::new("carry-second"));
+        let (output, previous) = second_snapshot(&first.0, &second.0, "1.1.0");
+        let catalogue = changed::read_json(&output.join("assets").join(CATALOGUE)).unwrap();
+        // The unchanged plugin keeps its previous entry and points at the release that holds it.
+        assert_eq!(
+            catalogue["plugins"][0]["versions"][0]["release"],
+            json!({"id": 41, "tag": "v1.0.0"})
+        );
+        assert_eq!(
+            catalogue["plugins"][0]["versions"][0]["artifacts"][0]["asset"],
+            "alpha-1.0.0-linux-amd64.tar.gz"
+        );
+        // The changed plugin is the new one, without a reference.
+        assert!(catalogue["plugins"][1]["versions"][0]
+            .get("release")
+            .is_none());
+        assert_eq!(
+            catalogue["plugins"][1]["versions"][0]["manifest"]["version"],
+            "1.1.0"
+        );
+        // Only the changed plugin's packages, the source and the bookkeeping are assets.
+        let mut names: Vec<_> = fs::read_dir(output.join("assets"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "SHA256SUMS".to_owned(),
+                "among-plugins.json".to_owned(),
+                "beta-1.1.0-linux-amd64.tar.gz".to_owned(),
+                "beta-1.1.0-linux-arm64.tar.gz".to_owned(),
+                source_archive_name(REVISION),
+            ]
+        );
+        // The prepared inventory check accepts it, and the references check
+        // passes against the previous catalogue.
+        let inventory = read_inventory(&output.join("inventory.json")).unwrap();
+        prepared_inventory(
+            &output,
+            7,
+            REVISION,
+            "v1.1.0",
+            &inventory.inventory_sha256,
+            &output.join("publication.json"),
+        )
+        .unwrap();
+        let referenced =
+            release::check_references(&catalogue, &previous.catalogue, 41, "v1.0.0").unwrap();
+        assert_eq!(referenced, BTreeSet::from([(41, "v1.0.0".to_owned())]));
+        // An altered carried entry is not the previous one any more.
+        let mut altered = catalogue.clone();
+        altered["plugins"][0]["versions"][0]["artifacts"][0]["sha256"] = json!("0".repeat(64));
+        assert!(release::check_references(&altered, &previous.catalogue, 41, "v1.0.0").is_err());
+        let mut wrong = catalogue;
+        wrong["plugins"][0]["versions"][0]["release"] = json!({"id": 42, "tag": "v1.0.0"});
+        assert!(release::check_references(&wrong, &previous.catalogue, 41, "v1.0.0").is_err());
+    }
+
+    #[test]
+    fn nothing_changed_and_content_changed_at_the_same_version_are_refused() {
+        let first = Scratch::new("none-first");
+        let (amd64, arm64) = (
+            build(&first.0, "amd64", &plugins()),
+            build(&first.0, "arm64", &plugins()),
+        );
+        let output = first.0.join("release");
+        catalogue_with(&amd64, &arm64, 7, "v1.0.0", REVISION, &output, accept).unwrap();
+        let previous = release::Previous {
+            catalogue: changed::read_json(&output.join("assets").join(CATALOGUE)).unwrap(),
+            release: json!({"id": 41, "tag_name": "v1.0.0", "draft": false, "immutable": true}),
+        };
+        let try_snapshot = |name: &str, next: Vec<(&str, Vec<u8>)>| {
+            let root = Scratch::new(name);
+            let (amd64, arm64) = (
+                build(&root.0, "amd64", &next),
+                build(&root.0, "arm64", &next),
+            );
+            catalogue_carrying(
+                &amd64,
+                &arm64,
+                7,
+                "v1.1.0",
+                REVISION,
+                &root.0.join("release"),
+                accept,
+                Some(&previous),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(try_snapshot("none-second", plugins()).contains("no plugin changed"));
+        let same_version = vec![
+            ("alpha", manifest("alpha", "first")),
+            ("beta", manifest("beta", "second, changed")),
+        ];
+        assert!(try_snapshot("none-third", same_version)
+            .contains("content changed but the version did not"));
     }
 
     fn edit_inventory(prepared: &Path, edit: impl Fn(&mut Value)) {
@@ -2142,9 +2376,17 @@ mod build_tests {
         let root = Scratch::new("toolchain");
         let amd64 = build(&root.0, "amd64", &plugins());
         let arm64 = build(&root.0, "arm64", &plugins());
-        let error = catalogue(&amd64, &arm64, 7, "v1.0.0", REVISION, &root.0.join("out"))
-            .unwrap_err()
-            .to_string();
+        let error = catalogue(
+            &amd64,
+            &arm64,
+            7,
+            "v1.0.0",
+            REVISION,
+            &root.0.join("out"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("invalid Rust runtime provenance"), "{error}");
     }
 

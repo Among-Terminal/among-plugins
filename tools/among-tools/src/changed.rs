@@ -515,10 +515,36 @@ pub(crate) fn valid_repository(repository: &str) -> Result<()> {
     Ok(())
 }
 
+// Takes the excluded tag and, when asked, the prerelease entries out of one page
+// of releases. A page that held releases but is empty afterwards gets a draft
+// placeholder, so that it does not read as the end of the list.
+fn filter_page(releases: &mut Value, exclude: Option<&str>, stable_only: bool) {
+    let Some(list) = releases.as_array_mut() else {
+        return;
+    };
+    let before = list.len();
+    list.retain(|release| {
+        exclude.is_none_or(|tag| release["tag_name"] != tag)
+            && !(stable_only && release["prerelease"].as_bool() != Some(false))
+    });
+    if before > 0 && list.is_empty() {
+        list.push(json!({"tag_name": "", "draft": true, "assets": []}));
+    }
+}
+
 // The tag of the previous release and its catalogue bytes, or no tag and an
 // empty schema 2 catalogue when there is no release with a catalogue. The tag
 // and the catalogue come from the same release by construction.
-pub(crate) fn fetch_previous(repository: &str) -> Result<(Option<String>, Vec<u8>)> {
+// `exclude` leaves one tag out, so that a run for a tag that already has a
+// release does not take that release for its own predecessor.
+// `stable_only` also leaves out every prerelease. A stable release is compared
+// with the last stable release, never with a release candidate: a candidate is
+// the stable release in advance, so the two would look unchanged.
+pub(crate) fn fetch_previous(
+    repository: &str,
+    exclude: Option<&str>,
+    stable_only: bool,
+) -> Result<(Option<String>, Vec<u8>)> {
     valid_repository(repository)?;
     let newest = newest_across_pages(|number| {
         let releases = process::capture(
@@ -531,7 +557,9 @@ pub(crate) fn fetch_previous(repository: &str) -> Result<(Option<String>, Vec<u8
             &[],
             8 * MAX_CATALOGUE_BYTES,
         )?;
-        Ok(serde_json::from_slice(&releases)?)
+        let mut releases: Value = serde_json::from_slice(&releases)?;
+        filter_page(&mut releases, exclude, stable_only);
+        Ok(releases)
     })?;
     let bytes = match &newest {
         Some(tag) => {
@@ -565,8 +593,8 @@ pub(crate) fn fetch_previous(repository: &str) -> Result<(Option<String>, Vec<u8
 
 // Writes the catalogue of the previous release to `output`; when there is none
 // the output is an empty schema 2 catalogue, so every plugin counts as new.
-pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
-    let (newest, bytes) = fetch_previous(repository)?;
+pub fn previous_catalogue(repository: &str, output: &Path, stable_only: bool) -> Result<()> {
+    let (newest, bytes) = fetch_previous(repository, None, stable_only)?;
     match &newest {
         Some(tag) => eprintln!("previous release: {tag}"),
         None => eprintln!("no published release has a catalogue: every plugin counts as new"),
@@ -984,8 +1012,48 @@ mod tests {
         assert!(valid_repository("Among-Terminal/among-plugins").is_ok());
         // The fetching entry points reject the same names without a network call;
         // a missing `gh` would otherwise show up as a different error.
-        let error = fetch_previous("-x/y").unwrap_err().to_string();
+        let error = fetch_previous("-x/y", None, false).unwrap_err().to_string();
         assert_eq!(error, "repository must look like owner/name");
-        assert!(previous_catalogue("-x/y", Path::new("/nonexistent/out")).is_err());
+        assert!(previous_catalogue("-x/y", Path::new("/nonexistent/out"), false).is_err());
+    }
+
+    #[test]
+    fn a_stable_release_is_not_compared_with_its_own_release_candidates() {
+        let release = |tag: &str, id: u64, at: &str, prerelease: bool| {
+            json!({"tag_name": tag, "id": id, "published_at": at, "draft": false,
+                   "prerelease": prerelease, "assets": [{"name": CATALOGUE_ASSET}]})
+        };
+        let page = || {
+            json!([
+                release("v0.2.0-rc.2", 3, "2026-03-01T00:00:00Z", true),
+                release("v0.2.0-rc.1", 2, "2026-02-01T00:00:00Z", true),
+                release("v0.1.0", 1, "2026-01-01T00:00:00Z", false),
+            ])
+        };
+        // A candidate's predecessor may be an earlier candidate...
+        let mut all = page();
+        filter_page(&mut all, None, false);
+        assert_eq!(
+            newest_with_catalogue(&all).unwrap().as_deref(),
+            Some("v0.2.0-rc.2")
+        );
+        // ...but the stable release 0.2.0 is compared with the last stable one.
+        let mut stable = page();
+        filter_page(&mut stable, Some("v0.2.0"), true);
+        assert_eq!(
+            newest_with_catalogue(&stable).unwrap().as_deref(),
+            Some("v0.1.0")
+        );
+        // With only candidates published there is no previous release at all,
+        // and a page that held only candidates does not read as the end.
+        let mut only = json!([release("v0.2.0-rc.1", 2, "2026-02-01T00:00:00Z", true)]);
+        filter_page(&mut only, None, true);
+        assert_eq!(only.as_array().unwrap().len(), 1);
+        assert_eq!(newest_with_catalogue(&only).unwrap(), None);
+        // A release without a prerelease flag is not taken for stable.
+        let mut unknown = json!([{"tag_name": "x", "id": 5, "published_at": "2026-05-01T00:00:00Z",
+                                  "draft": false, "assets": [{"name": CATALOGUE_ASSET}]}]);
+        filter_page(&mut unknown, None, true);
+        assert_eq!(newest_with_catalogue(&unknown).unwrap(), None);
     }
 }
