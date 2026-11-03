@@ -11,6 +11,93 @@ approved bytes, use [the reusable workflow](author-release.md#publishing-approve
 The official producer commands below also retain the historical schema1 catalogue
 format for artifact inspection; that catalogue is not an ordinary 0.2.x install input.
 
+## Independent versions and snapshot releases
+
+Every plugin has its own semantic version in `plugins/<id>/among-plugin.json`. Raise it
+only when that plugin changes, and leave it alone when it does not. A plugin changes
+when its packaged content changes: the executable, the manifest apart from `version`,
+or the attribution and dependency files in the package. Code in the shared `src/`
+modules goes into every executable, so a change there changes every plugin that links
+it. Compatibility with the application is not the plugin version: it is the `api`
+major and minor the manifest declares.
+
+A release is a snapshot of the whole repository:
+
+- one immutable GitHub release with one `v*` tag;
+- one `among-plugins.json` (schema 2) among its assets, listing exactly one version of
+  every plugin;
+- plugins that did not change keep their version, plugins that did carry their raised
+  version.
+
+The tag is only a label of the snapshot, not a plugin version. There are no per-plugin
+tags such as `clock/v1.2.3`: the application reads the repository's latest release, whose
+catalogue describes only that release, and the release workflows accept only tags of the
+form `v[A-Za-z0-9._-]`.
+
+Known limitation. Rebuilding an unchanged plugin for a new tag gives the same content but
+not the same archive: the package records the source commit in `SOURCE.json`, and the
+catalogue names the tag's commit as the version's `revision`. The application treats the
+same version with another package digest or another revision as a publisher
+inconsistency and offers no update for it. Raising a version only for that reason is
+refused by the check below, so this needs a decision about packaging before the second
+snapshot is published.
+
+### Checking versions against the previous release
+
+`among-tools changed-plugins` compares the plugins that were just packaged (the
+`build.json` that `plugin-packages` writes, one per architecture) with the catalogue of
+the previous release and fails when:
+
+- a plugin's packaged content changed but its version did not;
+- a plugin's version rose but its packaged content did not;
+- a plugin's version is lower than before, or is not a semantic version without build
+  metadata.
+
+New plugins pass, and a plugin missing from the build is reported and passes. A package
+for an architecture that the previous release lacks counts as a change. Three kinds of
+member are not content: `SOURCE.json` (names the commit), `THIRD_PARTY/RUST/native/`
+(describes the runner's installed toolchain) and `among-plugin.json` (compared as parsed
+data without `version`). Across three commits with unchanged plugin code, only these
+members differed.
+
+The previous release is the newest published release, a prerelease included, that has an
+`among-plugins.json` asset; drafts are skipped. A prerelease counts because its bytes are
+already out. When no release has a catalogue, every plugin counts as new and the check
+passes. `checks.yml` runs it on every pull request, after packaging, and a second step
+proves on the real build that unchanged content passes and a changed executable without a
+version raise fails.
+
+```sh
+among-tools previous-catalogue Among-Terminal/among-plugins previous-catalogue.json
+among-tools changed-plugins previous-catalogue.json dist/amd64/build.json dist/arm64/build.json
+```
+
+When it fails because content changed, raise that plugin's version in its
+`among-plugin.json` in the same pull request. When it fails because a version rose without
+a change, revert the version.
+
+### Release candidates
+
+A candidate is a prerelease of the same repository with a tag `v<label>-rc.N`. Plugin
+manifests keep the versions they will have in the stable release; the candidate suffix is
+only in the tag.
+
+1. Merge the changes, with the plugin versions raised as the check requires.
+2. Run `Official plugin candidate` with `publish` off on the commit to prepare and inspect
+   the bytes (see [author-release.md](author-release.md#publishing-approved-preparation-bytes)).
+3. After the owner approves the exact tag and commit, the owner creates the tag
+   `v<label>-rc.N` and runs the workflow with `publish`, `prerelease` and the approved
+   run, artifact and checksum inputs. The release is a prerelease, so the application's
+   latest lookup ignores it.
+4. Install it with the application's development mode (`--plugin-development`, "Use
+   latest prerelease" for the repository).
+5. The stable release is the tag `v<label>` on the same commit with the same bytes. A
+   fix after a candidate changes a plugin, so the check requires its version to rise
+   (the candidate is the previous release); then make another candidate (`-rc.N+1`).
+
+Publishing, tagging and the owner's approval are separate steps that no pull request
+performs.
+
 ## Native preparation
 
 Use Rust 1.98.1 with its matching `rust-docs`/`rust-src` components, binutils

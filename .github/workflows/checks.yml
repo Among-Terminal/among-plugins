@@ -69,6 +69,34 @@ jobs:
           cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > dist/vendor-config.toml
           tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$PWD/dist/${{ matrix.architecture }}"
           (cd "dist/${{ matrix.architecture }}" && sha256sum -c SHA256SUMS)
+      - name: Plugin versions match what changed since the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          build="dist/${{ matrix.architecture }}/build.json"
+          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
+          "$tool" changed-plugins "$RUNNER_TEMP/previous-catalogue.json" "$build"
+      - name: The changed-plugin check separates same content from changed content
+        run: |
+          set -euo pipefail
+          # A catalogue made from this very build is the previous release of a
+          # build whose content did not change: it must pass. Changing one
+          # executable digest in the build without raising its version must fail.
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          build="dist/${{ matrix.architecture }}/build.json"
+          baseline="$RUNNER_TEMP/baseline-catalogue.json"
+          jq '{schema_version: 2, plugins: [.packages[] | {id: .manifest.id, versions: [{manifest, artifacts: [.artifact]}]}]}' "$build" > "$baseline"
+          "$tool" changed-plugins "$baseline" "$build"
+          mutated="$RUNNER_TEMP/mutated-build.json"
+          jq '(.packages[0].artifact.members[] | select(.executable) | .sha256) = ("0" * 64)' "$build" > "$mutated"
+          if "$tool" changed-plugins "$baseline" "$mutated" > "$RUNNER_TEMP/mutated.log" 2>&1; then
+            echo "a changed executable without a version raise was accepted" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/mutated.log"
+          grep -E '^FAIL .*: packaged content changed .* the version is still ' "$RUNNER_TEMP/mutated.log"
       - name: A manifest without system.metrics is not packaged for the real binary
         run: |
           set -euo pipefail
