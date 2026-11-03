@@ -25,7 +25,7 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
        among-tools resolve-tag <repository-id> <tag>
        among-tools previous-catalogue <owner/name> <new-output>
-       among-tools changed-plugins <previous-catalogue.json> <build.json>...";
+       among-tools changed-plugins [--pending] <previous-catalogue.json> <build.json>...";
 
 fn channel(name: &str) -> Result<author::Channel> {
     match name {
@@ -154,9 +154,15 @@ fn run() -> Result<()> {
         [command, repository, output] if command == "previous-catalogue" => {
             changed::previous_catalogue(repository, Path::new(output))
         }
+        [command, flag, previous, builds @ ..]
+            if command == "changed-plugins" && flag == "--pending" && !builds.is_empty() =>
+        {
+            let builds: Vec<_> = builds.iter().map(Path::new).collect();
+            changed::run(Path::new(previous), &builds, true)
+        }
         [command, previous, builds @ ..] if command == "changed-plugins" && !builds.is_empty() => {
             let builds: Vec<_> = builds.iter().map(Path::new).collect();
-            changed::run(Path::new(previous), &builds)
+            changed::run(Path::new(previous), &builds, false)
         }
         _ => Err(USAGE.into()),
     }

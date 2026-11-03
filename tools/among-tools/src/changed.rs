@@ -34,8 +34,8 @@ struct Member {
 }
 
 #[derive(Clone, Debug)]
-struct Plugin {
-    version: String,
+pub(crate) struct Plugin {
+    pub(crate) version: String,
     // The manifest without its `version`.
     manifest: Value,
     // Content members per architecture, build records removed.
@@ -87,7 +87,7 @@ fn plugin_of(manifest: &Value, architecture: &str, artifact: &Value) -> Result<P
 }
 
 // A release catalogue, schema 1 or 2: one version per plugin.
-fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
+pub(crate) fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
     match catalogue["schema_version"].as_u64() {
         Some(1 | 2) => {}
         other => return Err(format!("unsupported catalogue schema {other:?}").into()),
@@ -135,7 +135,7 @@ fn from_catalogue(catalogue: &Value) -> Result<BTreeMap<String, Plugin>> {
 }
 
 // The `build.json` that `plugin-packages` writes for one architecture.
-fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
+pub(crate) fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
     let mut plugins: BTreeMap<String, Plugin> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for build in builds {
@@ -175,7 +175,7 @@ fn from_builds(builds: &[Value]) -> Result<BTreeMap<String, Plugin>> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Identifier {
+pub(crate) enum Identifier {
     Number(u64),
     Text(String),
 }
@@ -184,9 +184,9 @@ enum Identifier {
 // Build metadata is refused: a plugin version that differs only by metadata
 // would compare equal and hide a missing raise.
 #[derive(Debug, PartialEq, Eq)]
-struct Version {
-    core: [u64; 3],
-    pre: Vec<Identifier>,
+pub(crate) struct Version {
+    pub(crate) core: [u64; 3],
+    pub(crate) pre: Vec<Identifier>,
 }
 
 fn number(part: &str) -> Option<u64> {
@@ -197,7 +197,7 @@ fn number(part: &str) -> Option<u64> {
 }
 
 impl Version {
-    fn parse(version: &str) -> Result<Self> {
+    pub(crate) fn parse(version: &str) -> Result<Self> {
         let fail = || format!("`{version}` is not a semantic version without build metadata");
         let (core, pre) = match version.split_once('-') {
             Some((core, pre)) => (core, Some(pre)),
@@ -263,7 +263,7 @@ impl PartialOrd for Version {
 // What differs between the previous and the current plugin, empty when equal.
 // Only architectures that were just built are compared, so a job that packages
 // one architecture does not call the other one changed.
-fn differences(previous: &Plugin, current: &Plugin) -> Vec<String> {
+pub(crate) fn differences(previous: &Plugin, current: &Plugin) -> Vec<String> {
     let mut found = Vec::new();
     if previous.manifest != current.manifest {
         found.push("manifest".to_owned());
@@ -289,7 +289,14 @@ pub struct Report {
     pub failures: usize,
 }
 
-fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugin>) -> Report {
+// With `pending`, changed content at an unchanged version passes: that is the
+// state of every ordinary pull request, because the version is raised once, by
+// the release pull request. Everything else is refused in both modes.
+fn compare(
+    previous: &BTreeMap<String, Plugin>,
+    current: &BTreeMap<String, Plugin>,
+    pending: bool,
+) -> Report {
     let mut report = Report {
         lines: Vec::new(),
         failures: 0,
@@ -337,6 +344,13 @@ fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugi
                 format!("version fell from {} to {}", before.version, now.version),
             ),
             (Ordering::Equal, true) => (true, format!("unchanged at {}", now.version)),
+            (Ordering::Equal, false) if pending => (
+                true,
+                format!(
+                    "packaged content changed ({list}); the release raises the version from {}",
+                    now.version
+                ),
+            ),
             (Ordering::Equal, false) => (
                 false,
                 format!(
@@ -371,11 +385,15 @@ fn compare(previous: &BTreeMap<String, Plugin>, current: &BTreeMap<String, Plugi
     report
 }
 
-pub fn check(catalogue: &Value, builds: &[Value]) -> Result<Report> {
-    Ok(compare(&from_catalogue(catalogue)?, &from_builds(builds)?))
+pub fn check(catalogue: &Value, builds: &[Value], pending: bool) -> Result<Report> {
+    Ok(compare(
+        &from_catalogue(catalogue)?,
+        &from_builds(builds)?,
+        pending,
+    ))
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     let bytes = std::fs::read(path)?;
     if bytes.len() > 32 * MAX_CATALOGUE_BYTES {
         return Err(format!("{} is unreasonably large", path.display()).into());
@@ -383,13 +401,13 @@ fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub fn run(previous: &Path, builds: &[&Path]) -> Result<()> {
+pub fn run(previous: &Path, builds: &[&Path], pending: bool) -> Result<()> {
     let catalogue = read_json(previous)?;
     let builds = builds
         .iter()
         .map(|path| read_json(path))
         .collect::<Result<Vec<_>>>()?;
-    let report = check(&catalogue, &builds)?;
+    let report = check(&catalogue, &builds, pending)?;
     for line in &report.lines {
         println!("{line}");
     }
@@ -406,8 +424,12 @@ pub fn run(previous: &Path, builds: &[&Path]) -> Result<()> {
 // The newest published release, a prerelease included, whose assets contain a
 // catalogue. A prerelease counts because its bytes are already out: the host
 // refuses the same version with different bytes. Drafts are not published and
-// are skipped. GitHub lists releases newest first.
+// are skipped. Among the candidates of one page the newest is the one with the
+// latest `published_at` (an ISO 8601 UTC time, so text order is time order),
+// ties broken by the larger release id; the order GitHub lists them in is not
+// relied on.
 fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
+    let mut best: Option<(String, u64, String)> = None;
     for release in releases.as_array().ok_or("release list is not an array")? {
         if release["draft"]
             .as_bool()
@@ -420,17 +442,50 @@ fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
             .ok_or("release has no asset list")?
             .iter()
             .any(|asset| asset["name"] == CATALOGUE_ASSET);
-        if has {
-            return Ok(Some(text(release, "tag_name")?.to_owned()));
+        if !has {
+            continue;
+        }
+        let key = (
+            text(release, "published_at")?.to_owned(),
+            release["id"].as_u64().ok_or("release has no id")?,
+            text(release, "tag_name")?.to_owned(),
+        );
+        if best
+            .as_ref()
+            .is_none_or(|known| (&key.0, key.1) > (&known.0, known.1))
+        {
+            best = Some(key);
         }
     }
-    Ok(None)
+    Ok(best.map(|(_, _, tag)| tag))
 }
 
-// Writes the catalogue of the previous release to `output`; when there is none
-// the output is an empty schema 2 catalogue, so every plugin counts as new.
-pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
+// The most pages of 100 releases that are read looking for a catalogue. A
+// repository with more releases than this and none with a catalogue in them is
+// reported instead of being treated as having no previous release.
+const MAX_RELEASE_PAGES: u32 = 20;
+
+// Reads release pages until one holds a published release with a catalogue.
+fn newest_across_pages(mut page: impl FnMut(u32) -> Result<Value>) -> Result<Option<String>> {
+    for number in 1..=MAX_RELEASE_PAGES {
+        let releases = page(number)?;
+        if releases
+            .as_array()
+            .ok_or("release list is not an array")?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        if let Some(tag) = newest_with_catalogue(&releases)? {
+            return Ok(Some(tag));
+        }
+    }
+    Err(format!("no release with a catalogue in the newest {MAX_RELEASE_PAGES} pages").into())
+}
+
+pub(crate) fn valid_repository(repository: &str) -> Result<()> {
     if repository.split('/').count() != 2
+        || repository.split('/').any(str::is_empty)
         || repository.starts_with('-')
         || !repository
             .bytes()
@@ -438,24 +493,34 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
     {
         return Err("repository must look like owner/name".into());
     }
-    let releases = process::capture(
-        Command::new("gh").args([
-            "api",
-            "--hostname",
-            "github.com",
-            &format!("repos/{repository}/releases?per_page=100"),
-        ]),
-        &[],
-        8 * MAX_CATALOGUE_BYTES,
-    )?;
-    let bytes = match newest_with_catalogue(&serde_json::from_slice(&releases)?)? {
+    Ok(())
+}
+
+// The tag of the previous release and its catalogue bytes, or no tag and an
+// empty schema 2 catalogue when there is no release with a catalogue. The tag
+// and the catalogue come from the same release by construction.
+pub(crate) fn fetch_previous(repository: &str) -> Result<(Option<String>, Vec<u8>)> {
+    valid_repository(repository)?;
+    let newest = newest_across_pages(|number| {
+        let releases = process::capture(
+            Command::new("gh").args([
+                "api",
+                "--hostname",
+                "github.com",
+                &format!("repos/{repository}/releases?per_page=100&page={number}"),
+            ]),
+            &[],
+            8 * MAX_CATALOGUE_BYTES,
+        )?;
+        Ok(serde_json::from_slice(&releases)?)
+    })?;
+    let bytes = match &newest {
         Some(tag) => {
-            eprintln!("previous release: {tag}");
             let bytes = process::capture(
                 Command::new("gh").args([
                     "release",
                     "download",
-                    &tag,
+                    tag,
                     "-R",
                     repository,
                     "-p",
@@ -470,14 +535,28 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
             bytes
         }
         None => {
-            eprintln!("no published release has a catalogue: every plugin counts as new");
             let mut empty =
                 serde_json::to_vec_pretty(&json!({"schema_version": 2, "plugins": []}))?;
             empty.push(b'\n');
             empty
         }
     };
-    archive::write_new(output, &bytes)
+    Ok((newest, bytes))
+}
+
+// Writes the catalogue of the previous release to `output`; when there is none
+// the output is an empty schema 2 catalogue, so every plugin counts as new.
+pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
+    let (newest, bytes) = fetch_previous(repository)?;
+    match &newest {
+        Some(tag) => eprintln!("previous release: {tag}"),
+        None => eprintln!("no published release has a catalogue: every plugin counts as new"),
+    }
+    archive::write_new(output, &bytes)?;
+    // The tag of the previous release on stdout (an empty line when there is
+    // none), for the release planner.
+    println!("{}", newest.unwrap_or_default());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -518,7 +597,22 @@ mod tests {
     }
 
     fn verdict(previous: &Value, built: &Value) -> Report {
-        check(previous, std::slice::from_ref(built)).unwrap()
+        check(previous, std::slice::from_ref(built), false).unwrap()
+    }
+
+    #[test]
+    fn pending_mode_accepts_only_changed_content_at_the_same_version() {
+        let previous = catalogue("0.2.0", "bin-a", "c", "r");
+        let changed = build("0.2.0", "bin-b", "c", "r");
+        let report = check(&previous, std::slice::from_ref(&changed), true).unwrap();
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        // A raise without content and a falling version stay refused.
+        let raised = build("0.2.1", "bin-a", "c", "r");
+        assert_eq!(check(&previous, &[raised], true).unwrap().failures, 1);
+        let lower = build("0.1.9", "bin-b", "c", "r");
+        assert_eq!(check(&previous, &[lower], true).unwrap().failures, 1);
+        // Strict mode still refuses the first case.
+        assert_eq!(check(&previous, &[changed], false).unwrap().failures, 1);
     }
 
     #[test]
@@ -718,7 +812,12 @@ mod tests {
     #[test]
     fn build_records_for_the_same_architecture_twice_are_refused() {
         let one = build("0.2.0", "bin-a", "c", "r");
-        assert!(check(&catalogue("0.2.0", "bin-a", "c", "r"), &[one.clone(), one]).is_err());
+        assert!(check(
+            &catalogue("0.2.0", "bin-a", "c", "r"),
+            &[one.clone(), one],
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -732,31 +831,112 @@ mod tests {
 
     #[test]
     fn the_previous_release_is_the_newest_published_one_with_a_catalogue() {
-        let release = |tag: &str, draft: bool, prerelease: bool, asset: &str| {
-            json!({"tag_name": tag, "draft": draft, "prerelease": prerelease,
+        let release = |tag: &str, id: u64, at: &str, draft: bool, asset: &str| {
+            json!({"tag_name": tag, "id": id, "published_at": at, "draft": draft,
                    "assets": [{"name": asset}, {"name": "clock-linux-amd64.tar.gz"}]})
         };
+        // The list is deliberately not in time order: the newest by
+        // `published_at` wins wherever it sits, drafts and releases without a
+        // catalogue never do.
         let list = json!([
-            release("v0.3.0", true, false, CATALOGUE_ASSET),
-            release("v0.2.1", false, false, "other.json"),
-            release("v0.2.0-rc.1", false, true, CATALOGUE_ASSET),
-            release("v0.1.0", false, false, CATALOGUE_ASSET),
+            release("v0.1.0", 1, "2026-01-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("v0.3.0", 9, "2026-09-01T00:00:00Z", true, CATALOGUE_ASSET),
+            release("v0.2.1", 8, "2026-08-01T00:00:00Z", false, "other.json"),
+            release(
+                "v0.2.0-rc.1",
+                5,
+                "2026-05-01T00:00:00Z",
+                false,
+                CATALOGUE_ASSET
+            ),
+            release(
+                "v0.2.0-rc.2",
+                6,
+                "2026-06-01T00:00:00Z",
+                false,
+                CATALOGUE_ASSET
+            ),
         ]);
         assert_eq!(
             newest_with_catalogue(&list).unwrap().as_deref(),
-            Some("v0.2.0-rc.1")
+            Some("v0.2.0-rc.2")
         );
+        // The same instant is broken by the larger release id.
+        let tie = json!([
+            release("a", 4, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("b", 7, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("c", 3, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+        ]);
+        assert_eq!(newest_with_catalogue(&tie).unwrap().as_deref(), Some("b"));
         assert_eq!(newest_with_catalogue(&json!([])).unwrap(), None);
         assert_eq!(
-            newest_with_catalogue(&json!([release("v1", true, false, CATALOGUE_ASSET)])).unwrap(),
+            newest_with_catalogue(&json!([release(
+                "v1",
+                1,
+                "2026-01-01T00:00:00Z",
+                true,
+                CATALOGUE_ASSET
+            )]))
+            .unwrap(),
             None
         );
     }
 
     #[test]
-    fn a_repository_name_with_option_syntax_is_refused() {
-        assert!(previous_catalogue("--version", Path::new("/nonexistent/out")).is_err());
-        assert!(previous_catalogue("--version/x", Path::new("/nonexistent/out")).is_err());
-        assert!(previous_catalogue("a/b/c", Path::new("/nonexistent/out")).is_err());
+    fn pages_are_read_until_a_release_with_a_catalogue_is_found() {
+        let plain = |tag: &str| {
+            json!({"tag_name": tag, "id": 1, "published_at": "2026-01-01T00:00:00Z",
+                   "draft": false, "assets": [{"name": "other.json"}]})
+        };
+        let with = json!({"tag_name": "v0.2.0", "id": 2, "published_at": "2026-02-01T00:00:00Z",
+                          "draft": false, "assets": [{"name": CATALOGUE_ASSET}]});
+        let mut asked = Vec::new();
+        let found = newest_across_pages(|number| {
+            asked.push(number);
+            Ok(match number {
+                1 => json!([plain("a"), plain("b")]),
+                2 => json!([plain("c"), with.clone()]),
+                _ => panic!("read past the page that has a catalogue"),
+            })
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("v0.2.0"));
+        assert_eq!(asked, [1, 2]);
+        // An empty page is the end of the list.
+        assert_eq!(
+            newest_across_pages(|n| Ok(if n == 1 {
+                json!([plain("a")])
+            } else {
+                json!([])
+            }))
+            .unwrap(),
+            None
+        );
+        // Endless pages without a catalogue are an error, not "no release".
+        assert!(newest_across_pages(|_| Ok(json!([plain("a")]))).is_err());
+        assert!(newest_across_pages(|_| Err("network".into())).is_err());
+    }
+
+    #[test]
+    fn repository_names_are_validated_before_any_process_starts() {
+        for bad in [
+            "--version",
+            "--version/x",
+            "-x/y",
+            "a/b/c",
+            "a",
+            "/b",
+            "a/",
+            "a b/c",
+            "a/b;rm",
+        ] {
+            assert!(valid_repository(bad).is_err(), "{bad}");
+        }
+        assert!(valid_repository("Among-Terminal/among-plugins").is_ok());
+        // The fetching entry points reject the same names without a network call;
+        // a missing `gh` would otherwise show up as a different error.
+        let error = fetch_previous("-x/y").unwrap_err().to_string();
+        assert_eq!(error, "repository must look like owner/name");
+        assert!(previous_catalogue("-x/y", Path::new("/nonexistent/out")).is_err());
     }
 }
