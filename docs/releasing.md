@@ -107,8 +107,11 @@ workflow token would not start them). No bot opens pull requests.
    creates the branch `release/<label>`, raises the manifests, commits
    `chore(release): <label>`, pushes and opens the pull request. It refuses when the label
    is already a tag, locally or on the remote. If the commit or the push fails, it puts the
-   working tree back on `main` and deletes the branch; if only opening the pull request
-   fails, it says that the branch was pushed. `plugin-release-plan` prints the same plan as
+   working tree back on `main` and deletes the branch. Once the push has succeeded the branch
+   is kept, locally and on origin (deleting the local copy would make a retry a
+   non-fast-forward push); if only opening the pull request fails, the error says that the
+   branch exists and gives the `gh pr create` call to continue with, or tells to delete the
+   branch in both places and run the command again. `plugin-release-plan` prints the same plan as
    JSON and touches nothing.
 
 How the plan is made:
@@ -194,10 +197,11 @@ the stable release is made from a candidate's bytes (see below). Only the commit
   `main`;
 - every other release keeps the rule that its commit is titled `chore(release): <tag>`. A
   second candidate of the first label is not the first release, because the first candidate
-  already is a release with a catalogue.
+  already is a release with a catalogue, and neither is any candidate while another
+  `v0.2.0-rc.*` tag exists, so deleting a release cannot reopen the exemption.
 
 `among-tools first-release Among-Terminal/among-plugins <commit>` checks that no release with
-a catalogue exists, that neither `v0.2.0` nor `v0.2.0-rc.1` exists, that the commit is an
+a catalogue exists, that no `v0.2.0-rc.*` tag and not `v0.2.0` exists, that the commit is an
 ancestor of `main` (its merge base with `main` is the commit) and that the checks passed on it,
 and prints the steps. It creates nothing. The steps are:
 

@@ -489,10 +489,33 @@ pub(crate) enum CommitRule {
 }
 
 // The first release is the first label with no other release that has a
-// catalogue. A second candidate of the first label is not the first release:
-// the first candidate is a release with a catalogue.
-pub(crate) fn is_first_release(stable_label: &str, other_release_with_catalogue: bool) -> bool {
-    stable_label == FIRST_LABEL && !other_release_with_catalogue
+// catalogue (`previous_release` is what the lookup of the previous release
+// found, this candidate left out) and no other candidate tag. A second
+// candidate of the first label is not the first release, and neither is a
+// candidate whose sibling's release was deleted: the tag remains.
+pub(crate) fn is_first_release(
+    stable_label: &str,
+    previous_release: Option<&str>,
+    candidate_tags: &[String],
+    this_candidate: &str,
+) -> bool {
+    stable_label == FIRST_LABEL
+        && previous_release.is_none()
+        && candidate_tags.iter().all(|tag| tag == this_candidate)
+}
+
+pub(crate) fn commit_rule(first_release: bool, on_main: bool) -> CommitRule {
+    if first_release {
+        CommitRule::FirstRelease { on_main }
+    } else {
+        CommitRule::ReleaseCommit
+    }
+}
+
+// Whether the comparison of `commit` with the default branch has the commit as
+// the merge base, which is what being an ancestor of (or being) it means.
+fn merge_base_is(comparison: &Value, commit: &str) -> bool {
+    comparison["merge_base_commit"]["sha"].as_str() == Some(commit)
 }
 
 // The commit of a candidate: titled by `rule`, and checked by a successful push
@@ -545,7 +568,7 @@ pub(crate) fn check_candidate_commit(
 // of the two is the commit itself.
 fn commit_on_main(repository: &str, commit: &str) -> Result<bool> {
     let comparison = release_json(repository, &format!("compare/{commit}...main"))?;
-    Ok(comparison["merge_base_commit"]["sha"].as_str() == Some(commit))
+    Ok(merge_base_is(&comparison, commit))
 }
 
 fn require_candidate_commit(repository: &str, commit: &str, candidate_tag: &str) -> Result<()> {
@@ -555,19 +578,16 @@ fn require_candidate_commit(repository: &str, commit: &str, candidate_tag: &str)
         &format!("actions/runs?head_sha={commit}&per_page=100"),
     )?;
     // The first release has no release commit; every other one has.
+    let stable = stable_label(candidate_tag)?;
+    let previous = fetch_previous(repository, Some(candidate_tag), false)?.0;
     let first = is_first_release(
-        &stable_label(candidate_tag)?,
-        fetch_previous(repository, Some(candidate_tag), false)?
-            .0
-            .is_some(),
+        &stable,
+        previous.as_deref(),
+        &candidate_tags(repository, &stable)?,
+        candidate_tag,
     );
-    let rule = if first {
-        CommitRule::FirstRelease {
-            on_main: commit_on_main(repository, commit)?,
-        }
-    } else {
-        CommitRule::ReleaseCommit
-    };
+    let on_main = first && commit_on_main(repository, commit)?;
+    let rule = commit_rule(first, on_main);
     check_candidate_commit(
         record["commit"]["message"].as_str().unwrap_or_default(),
         &runs,
@@ -604,10 +624,12 @@ pub fn run_first_release(repository: &str, commit: &str) -> Result<()> {
         .into());
     }
     let candidate = format!("{FIRST_LABEL}-rc.1");
-    for tag in [FIRST_LABEL, candidate.as_str()] {
-        if tag_exists(repository, tag)? {
-            return Err(format!("the tag {tag} already exists").into());
-        }
+    // A candidate tag that is left over from a deleted release counts as well.
+    if let Some(tag) = candidate_tags(repository, FIRST_LABEL)?.first() {
+        return Err(format!("the tag {tag} already exists").into());
+    }
+    if tag_exists(repository, FIRST_LABEL)? {
+        return Err(format!("the tag {FIRST_LABEL} already exists").into());
     }
     let runs = release_json(
         repository,
@@ -746,15 +768,24 @@ fn description(plan: &Plan) -> String {
 // `release/<label>`; merging the pull request is the owner's step, and it
 // creates no tag and no release.
 pub fn run_release_pr(arguments: &PlanArguments, dry_run: bool) -> Result<()> {
-    release_pr_with(arguments, dry_run, run_plan)
+    release_pr_with(arguments, dry_run, run_plan, open_pull_request)
 }
 
-// The planner is a parameter so that the guards and the clean-up can be tested
-// without GitHub.
+// Opens the pull request of a pushed release branch with the operator's `gh`.
+fn open_pull_request(root: &Path, branch: &str, title: &str, body: &str) -> Result<()> {
+    process::text(Command::new("gh").current_dir(root).args([
+        "pr", "create", "--base", "main", "--head", branch, "--title", title, "--body", body,
+    ]))?;
+    Ok(())
+}
+
+// The planner and the pull request opener are parameters so that the guards and
+// the clean-up can be tested without GitHub.
 fn release_pr_with(
     arguments: &PlanArguments,
     dry_run: bool,
     planner: impl Fn(&PlanArguments) -> Result<Plan>,
+    opener: impl Fn(&Path, &str, &str, &str) -> Result<()>,
 ) -> Result<()> {
     let root = arguments.root;
     if !git(root, &["status", "--porcelain"])?.trim().is_empty() {
@@ -791,18 +822,32 @@ fn release_pr_with(
     }
     let branch = format!("release/{}", plan.label);
     git(root, &["switch", "-c", &branch])?;
-    // From here every failure puts the working tree back on main, so that a
-    // retry starts from the state the operator began with.
-    let outcome = publish_branch(root, &plan, &branch);
-    if outcome.is_err() {
+    // A failure before the push has succeeded puts the working tree back on
+    // main and removes the branch, so that a retry starts from the state the
+    // operator began with.
+    if let Err(error) = push_branch(root, &plan, &branch) {
         let _ = git(root, &["checkout", "-q", "--", "."]);
         let _ = git(root, &["switch", "-q", "main"]);
         let _ = git(root, &["branch", "-q", "-D", &branch]);
+        return Err(error);
     }
-    outcome
+    // From here the branch exists on origin and is kept: deleting the local
+    // copy would make a retry fail as a non-fast-forward push.
+    let _ = git(root, &["switch", "-q", "main"]);
+    let title = format!("chore(release): {}", plan.label);
+    opener(root, &branch, &title, &description(&plan)).map_err(|error| {
+        format!(
+            "the branch {branch} exists locally and on origin, with the release commit, but the \
+             pull request was not opened ({error}); open it with `gh pr create --base main \
+             --head {branch} --title \"{title}\"`, or delete the branch locally and on origin \
+             and run this command again"
+        )
+        .into()
+    })
 }
 
-fn publish_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
+// Raises the manifests, commits and pushes the release branch.
+fn push_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
     apply(root, plan)?;
     let touched = git(root, &["diff", "--name-only"])?;
     if touched
@@ -817,21 +862,6 @@ fn publish_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
         &["commit", "-q", "-a", "-m", &title, "-m", &description(plan)],
     )?;
     git(root, &["push", "-q", "-u", "origin", branch])?;
-    process::text(Command::new("gh").current_dir(root).args([
-        "pr",
-        "create",
-        "--base",
-        "main",
-        "--head",
-        branch,
-        "--title",
-        &title,
-        "--body",
-        &description(plan),
-    ]))
-    .map_err(|error| {
-        format!("the branch {branch} was pushed but the pull request was not opened: {error}")
-    })?;
     Ok(())
 }
 
@@ -1819,13 +1849,68 @@ mod tests {
     }
 
     fn open_release_pr(work: &Path, dry_run: bool) -> Result<()> {
+        open_release_pr_with(work, dry_run, |_, _, _, _| Ok(()))
+    }
+
+    fn open_release_pr_with(
+        work: &Path,
+        dry_run: bool,
+        opener: impl Fn(&Path, &str, &str, &str) -> Result<()>,
+    ) -> Result<()> {
         let arguments = PlanArguments {
             root: work,
             repository: "Among-Terminal/among-plugins",
             candidate: None,
             builds: &[],
         };
-        release_pr_with(&arguments, dry_run, |_| Ok(fixed_plan()))
+        release_pr_with(&arguments, dry_run, |_| Ok(fixed_plan()), opener)
+    }
+
+    #[test]
+    fn a_pull_request_that_cannot_be_opened_keeps_the_pushed_branch() {
+        let (_scratch, remote, work) = release_fixture("opener");
+        let error = open_release_pr_with(&work, false, |_, _, _, _| Err("gh is down".into()))
+            .unwrap_err()
+            .to_string();
+        // The message says what exists and how to go on.
+        assert!(
+            error.contains("release/v0.2.1 exists locally and on origin"),
+            "{error}"
+        );
+        assert!(
+            error.contains("gh pr create --base main --head release/v0.2.1"),
+            "{error}"
+        );
+        assert!(error.contains("gh is down"), "{error}");
+        // The local branch is kept, so a retry is not a non-fast-forward push,
+        // and so is the remote one; the working tree is back on main and clean.
+        assert!(branches(&work).contains("release/v0.2.1"));
+        let remote_heads = git(&remote, &["branch", "--list"]).unwrap();
+        assert!(remote_heads.contains("release/v0.2.1"), "{remote_heads}");
+        assert_eq!(
+            git(&work, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "main"
+        );
+        assert!(git(&work, &["status", "--porcelain"]).unwrap().is_empty());
+        // The opener received the branch, the title and the plan as its body.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let (_s2, _r2, work2) = release_fixture("opener-args");
+        open_release_pr_with(&work2, false, |_, branch, title, body| {
+            seen.borrow_mut()
+                .push((branch.to_owned(), title.to_owned(), body.to_owned()));
+            Ok(())
+        })
+        .unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen[0].0, "release/v0.2.1");
+        assert_eq!(seen[0].1, "chore(release): v0.2.1");
+        assert!(
+            seen[0].2.contains("`clock`: 0.2.0 -> 0.2.1"),
+            "{}",
+            seen[0].2
+        );
     }
 
     fn branches(work: &Path) -> String {
@@ -2234,18 +2319,26 @@ mod tests {
         let first = CommitRule::FirstRelease { on_main: true };
         // The first release candidate, promoted to stable: no release commit, an
         // ordinary commit that the checks passed on.
-        assert!(is_first_release("v0.2.0", false));
+        let own = ["v0.2.0-rc.1".to_owned()];
+        assert!(is_first_release("v0.2.0", None, &own, "v0.2.0-rc.1"));
         assert!(
             check_candidate_commit("feat: an ordinary commit", &passed, "v0.2.0-rc.1", first)
                 .is_ok()
         );
         // A non-first release still needs its release commit: the ordinary
         // commit is refused under the rule that every other release gets.
-        assert!(!is_first_release("v0.3.0", false));
+        assert!(!is_first_release("v0.3.0", None, &[], "v0.3.0-rc.1"));
+        // Not the first release: another release with a catalogue exists (the
+        // first candidate, for a second one), or another candidate tag remains
+        // after its release was deleted, so deleting a release cannot reopen
+        // the exemption.
         assert!(
-            !is_first_release("v0.2.0", true),
+            !is_first_release("v0.2.0", Some("v0.2.0-rc.1"), &own, "v0.2.0-rc.2"),
             "a second candidate of v0.2.0"
         );
+        let both = ["v0.2.0-rc.1".to_owned(), "v0.2.0-rc.2".to_owned()];
+        assert!(!is_first_release("v0.2.0", None, &both, "v0.2.0-rc.2"));
+        assert!(is_first_release("v0.2.0", None, &[], "v0.2.0-rc.1"));
         assert!(check_candidate_commit(
             "feat: an ordinary commit",
             &passed,
@@ -2263,6 +2356,37 @@ mod tests {
         for bad in unverified_runs() {
             assert!(check_candidate_commit("feat: x", &bad, "v0.2.0-rc.1", first).is_err());
         }
+    }
+
+    #[test]
+    fn the_rule_follows_whether_it_is_the_first_release_and_whether_the_commit_is_on_main() {
+        assert_eq!(
+            commit_rule(true, true),
+            CommitRule::FirstRelease { on_main: true }
+        );
+        assert_eq!(
+            commit_rule(true, false),
+            CommitRule::FirstRelease { on_main: false }
+        );
+        // Not the first release: the release commit, whatever the ancestry says.
+        assert_eq!(commit_rule(false, true), CommitRule::ReleaseCommit);
+        assert_eq!(commit_rule(false, false), CommitRule::ReleaseCommit);
+    }
+
+    #[test]
+    fn a_commit_is_on_main_when_it_is_the_merge_base_of_the_comparison() {
+        let commit = "a".repeat(40);
+        let comparison = |sha: &str| json!({"status": "ahead", "merge_base_commit": {"sha": sha}});
+        assert!(merge_base_is(&comparison(&commit), &commit));
+        // The merge base is another commit: the commit is off main (diverged).
+        assert!(!merge_base_is(&comparison(&"b".repeat(40)), &commit));
+        // No merge base, or a malformed answer, is not an answer of "yes".
+        assert!(!merge_base_is(&json!({"status": "ahead"}), &commit));
+        assert!(!merge_base_is(
+            &json!({"merge_base_commit": {"sha": 7}}),
+            &commit
+        ));
+        assert!(!merge_base_is(&json!(null), &commit));
     }
 
     #[test]
