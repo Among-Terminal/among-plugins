@@ -394,6 +394,17 @@ jobs:
           printf 'x' >> "resized/$(jq -r '.packages[0].name' arm64/build.json)"
           refuse 'differs from its record' \
             "$tool" author-catalogue amd64 resized 7 v1.0.0 "$revision" resized-out
+          # The same plugins against the release just made: nothing changed, so
+          # there is nothing to release. (Carrying some plugins over while
+          # shipping others is covered by the tool's own tests.)
+          echo '{"id": 41, "tag_name": "v1.0.0", "draft": false, "immutable": true}' > previous-release.json
+          refuse 'no plugin changed since the previous release' \
+            "$tool" author-catalogue amd64 arm64 7 v1.0.1 "$revision" nothing-new \
+            --previous release/assets/among-plugins.json previous-release.json
+          echo '{"id": 41, "tag_name": "v1.0.0", "draft": true, "immutable": false}' > unpublished-release.json
+          refuse 'is not published' \
+            "$tool" author-catalogue amd64 arm64 7 v1.0.1 "$revision" from-draft \
+            --previous release/assets/among-plugins.json unpublished-release.json
 
   # The release workflow as an author's repository calls it, in check mode:
   # this repository's own plugins are built, packaged and catalogued on both
@@ -402,6 +413,6 @@ jobs:
   # fork this job would always fail and is skipped there instead.
   release-workflow-check:
     if: github.repository == 'Among-Terminal/among-plugins'
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
+    uses: ./.github/workflows/plugin-release.yml
     with:
       publish: false

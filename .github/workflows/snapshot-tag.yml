@@ -1,16 +1,20 @@
 name: Snapshot tag
 
-# When the release pull request is merged (a squash commit titled
-# `chore(release): v<label>` that changes nothing but plugin manifests), this
-# creates the one `v<label>` tag on that commit and starts the preparation run of
-# the official release workflow on it. It publishes nothing: publication stays
-# the owner's manual run of that workflow with the approved prepared bytes.
+# When the release pull request has been merged, this creates the one
+# `v<label>` tag on the merge commit. It does not trust the commit title: the
+# `Locked Rust source checks` run for that very commit has already rebuilt and
+# packaged the plugins and checked them strictly, and this job verifies the
+# release commit again against the previous release as it is now before it
+# creates anything. It publishes nothing and does not start the release workflow:
+# preparing and publishing stay manual runs of `Official plugin candidate` on the
+# tag, until that workflow's pin includes carrying unchanged plugins over.
 #
-# A tag created with the workflow token does not start `push` workflows, but a
-# `workflow_dispatch` does run, so the preparation is dispatched explicitly.
+# A tag created with the workflow token starts no `push` workflow, so nothing
+# else reacts to the new tag.
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ['Locked Rust source checks']
+    types: [completed]
 
 concurrency:
   group: snapshot-tag
@@ -20,35 +24,64 @@ permissions: {}
 
 jobs:
   tag:
-    if: "${{ startsWith(github.event.head_commit.message, 'chore(release): ') }}"
+    # Only a passed run of this repository's checks on a push to main, for a
+    # commit that is titled as a release.
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && startsWith(github.event.workflow_run.head_commit.message, 'chore(release): ') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
-      actions: write
+      actions: read
     env:
-      GH_TOKEN: ${{ github.token }}
       RUSTUP_TOOLCHAIN: 1.98.1
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-          fetch-depth: 2
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
       - name: Install the pinned Rust tools
         run: rustup toolchain install 1.98.1 --profile minimal
-      - name: Create the snapshot tag and start the preparation
+      - name: Build the tool
+        run: cargo build --quiet --manifest-path tools/among-tools/Cargo.toml --locked
+      - name: Download the build records of the checked release commit
         env:
-          MESSAGE: ${{ github.event.head_commit.message }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          subject="${MESSAGE%%$'\n'*}"
-          mapfile -t files < <(git diff-tree --no-commit-id --name-only -r --no-renames "$GITHUB_SHA")
-          label=$(cargo run --quiet --manifest-path tools/among-tools/Cargo.toml --locked -- snapshot-label "$subject" "${files[@]}")
-          if [ -z "$label" ]; then
-            echo "Not a release commit: nothing to tag."
-            exit 0
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir builds \
+            --name "plugin-version-builds-amd64-$RELEASE_SHA" \
+            --name "plugin-version-builds-arm64-$RELEASE_SHA"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+      - name: Verify the release commit and create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          # Strict version check against the previous release as it is now, the
+          # computed next label against the label in the title, and a diff that
+          # changes only version lines. Fails before anything is created.
+          label=$("$tool" snapshot-verify . "$GITHUB_REPOSITORY" \
+            "builds/plugin-version-builds-amd64-$RELEASE_SHA/build.json" \
+            "builds/plugin-version-builds-arm64-$RELEASE_SHA/build.json")
+          # Idempotent: the tag at this commit is only confirmed, a tag anywhere
+          # else is an error, and an existing tag is never moved.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$label" --jq '.object.type + " " + .object.sha' 2> /dev/null || true)
+          if [ -z "$existing" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$label" -f "sha=$RELEASE_SHA" > /dev/null
+            echo "Tagged $RELEASE_SHA as $label."
+          elif [ "$existing" = "commit $RELEASE_SHA" ]; then
+            echo "$label already points at $RELEASE_SHA."
+          else
+            echo "$label exists and points elsewhere ($existing)." >&2
+            exit 1
           fi
-          # Fails when the tag already exists, so a tag is never moved.
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/$label" -f "sha=$GITHUB_SHA" > /dev/null
-          gh workflow run official-plugin-release.yml --ref "$label"
-          echo "Tagged $GITHUB_SHA as $label and started the preparation run."

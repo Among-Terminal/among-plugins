@@ -70,6 +70,11 @@ jobs:
       commit: ${{ steps.pin.outputs.commit }}
       tag: ${{ steps.pin.outputs.tag }}
       prepared: ${{ steps.pin.outputs.prepared }}
+      # The release tag this run builds the catalogue for, empty for a check
+      # on a pull request. Only a run for a release tag carries unchanged
+      # plugins over from the previous release; a check on a pull request
+      # catalogues every plugin so that it still passes when none changed.
+      carry_tag: ${{ steps.pin.outputs.carry_tag }}
     steps:
       - name: Pin the tagged source commit without running author code
         id: pin
@@ -98,6 +103,12 @@ jobs:
             # A check run builds the event commit and publishes nothing.
             echo "commit=$SHA" >> "$GITHUB_OUTPUT"
             echo "tag=check" >> "$GITHUB_OUTPUT"
+            case "$REF" in
+              refs/tags/v*)
+                if printf '%s' "${REF#refs/tags/}" | grep -Eqx '[A-Za-z0-9._-]{1,128}'; then
+                  echo "carry_tag=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+                fi ;;
+            esac
             exit 0
           fi
           case "$REF" in
@@ -121,6 +132,7 @@ jobs:
           fi
           echo "commit=$SHA" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "carry_tag=$tag" >> "$GITHUB_OUTPUT"
 
   tools-amd64:
     runs-on: ubuntu-24.04
@@ -318,6 +330,8 @@ jobs:
           path: build/arm64
       - name: Catalogue, release asset set and draft binding, without publishing
         env:
+          GH_TOKEN: ${{ github.token }}
+          CARRY_TAG: ${{ needs.pin.outputs.carry_tag }}
           REPOSITORY_ID: ${{ github.repository_id }}
           PIN: ${{ needs.pin.outputs.commit }}
           TAG: ${{ needs.pin.outputs.tag }}
@@ -329,7 +343,20 @@ jobs:
           TOOL_SHA256: ${{ needs['tools-amd64'].outputs.sha256 }}
         run: |
           set -euo pipefail
-          tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
+          # A run for a release tag ships only the plugins that changed since the
+          # previous release and carries the others over from it.
+          previous=()
+          if [ -n "$CARRY_TAG" ]; then
+            tools/among-tools previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
+            if [ -f previous/release.json ]; then
+              previous=(--previous previous/catalogue.json previous/release.json)
+            fi
+          fi
+          tools/among-tools author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release "${previous[@]}"
+          if [ "${#previous[@]}" -gt 0 ]; then
+            tools/among-tools verify-references "$GITHUB_REPOSITORY" release/assets/among-plugins.json \
+              previous/catalogue.json "$(jq -r .tag_name previous/release.json)"
+          fi
           tools/among-tools release-binding release/inventory.json "$WORKFLOW_REF" "$RUN_ID" binding
           (cd release/assets && sha256sum -c SHA256SUMS)
           ls -l release/assets
@@ -412,6 +439,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          CARRY_TAG: ${{ needs.pin.outputs.carry_tag }}
           REPOSITORY_ID: ${{ github.repository_id }}
           PIN: ${{ needs.pin.outputs.commit }}
           TAG: ${{ needs.pin.outputs.tag }}
@@ -428,6 +456,15 @@ jobs:
           tool="$PWD/tools/among-tools"
           if [ "$PRERELEASE" = true ]; then channel=prerelease; else channel=stable; fi
           inventory="$PWD/release/inventory.json"
+          # The previous release as it is now, the one unchanged plugins are
+          # carried over from. A prepared candidate is checked against it again:
+          # if another release was published since the preparation, the carried
+          # entries no longer match and publication stops.
+          previous=()
+          "$tool" previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
+          if [ -f previous/release.json ]; then
+            previous=(--previous previous/catalogue.json previous/release.json)
+          fi
           if [ "$PREPARED" = true ]; then
             jq -e --arg repository "$REPOSITORY_ID" --arg source "$PIN" --arg run "$PREPARED_RUN" \
               --arg tool_repository "$TOOL_REPOSITORY" --arg tool_revision "$TOOL_REVISION" \
@@ -436,7 +473,14 @@ jobs:
             inventory="$PWD/publication-inventory.json"
             "$tool" prepared-inventory release "$REPOSITORY_ID" "$PIN" "$TAG" "$PREPARED_DIGEST" "$inventory"
           else
-            "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release
+            "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release "${previous[@]}"
+          fi
+          if [ "${#previous[@]}" -gt 0 ]; then
+            "$tool" verify-references "$GITHUB_REPOSITORY" release/assets/among-plugins.json \
+              previous/catalogue.json "$(jq -r .tag_name previous/release.json)"
+          elif jq -e '[.plugins[].versions[] | select(has("release"))] | length > 0' release/assets/among-plugins.json > /dev/null; then
+            echo "the catalogue carries plugins over but no previous release exists" >&2
+            exit 1
           fi
           "$tool" release-binding "$inventory" "$WORKFLOW_REF" "$RUN_ID" binding
           resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")

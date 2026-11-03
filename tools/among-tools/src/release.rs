@@ -746,19 +746,27 @@ pub(crate) fn reference(version: &Value) -> Result<Option<(u64, String)>> {
 // has no `release` reference lived in the previous release itself, so it gets
 // a reference to it; an entry that already carries one keeps it. It is an error
 // when an unchanged plugin has no entry in the previous catalogue.
+// Refuses a previous release that others may not point at: a draft or a
+// release that is not immutable. Returns its id and tag.
+pub(crate) fn check_previous(previous: &Previous) -> Result<(u64, String)> {
+    let id = previous.release["id"]
+        .as_u64()
+        .ok_or("previous release has no id")?;
+    let tag = previous.release["tag_name"]
+        .as_str()
+        .ok_or("previous release has no tag")?;
+    check_release(&previous.release, id, tag)?;
+    Ok((id, tag.to_owned()))
+}
+
 pub(crate) fn carry_over(
     previous: &Previous,
     fresh: &Value,
     unchanged: &BTreeSet<String>,
 ) -> Result<Value> {
-    let (previous_release, previous) = (&previous.release, &previous.catalogue);
-    let id = previous_release["id"]
-        .as_u64()
-        .ok_or("previous release has no id")?;
-    let tag = previous_release["tag_name"]
-        .as_str()
-        .ok_or("previous release has no tag")?;
-    check_release(previous_release, id, tag)?;
+    let (id, tag) = check_previous(previous)?;
+    let tag = tag.as_str();
+    let previous = &previous.catalogue;
     let mut result = fresh.clone();
     let entries = result["plugins"]
         .as_array_mut()

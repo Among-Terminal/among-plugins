@@ -618,6 +618,7 @@ fn catalogue_carrying(
     }
     let carried: BTreeSet<String> = match previous {
         Some(previous) => {
+            release::check_previous(previous)?;
             let records = [
                 changed::read_json(&builds[0].directory.join("build.json"))?,
                 changed::read_json(&builds[1].directory.join("build.json"))?,
