@@ -61,6 +61,9 @@ pub struct Package {
     pub id: String,
     pub name: String,
     pub manifest_sha256: String,
+    // The parsed manifest that is also packaged, so that a build record alone
+    // shows what a plugin is without opening its archive.
+    pub manifest: Value,
     pub artifact: Artifact,
     pub needed_libraries: Vec<String>,
 }
@@ -361,6 +364,7 @@ pub fn packages(
             id: plugin.id,
             name,
             manifest_sha256: archive::hash(&plugin.manifest),
+            manifest: strict::parse(&plugin.manifest)?,
             artifact: Artifact {
                 os: "linux".into(),
                 architecture: architecture.clone(),
@@ -481,6 +485,7 @@ fn load(
             .ok_or_else(|| format!("{} has no manifest", package.name))?;
         let (version, entrypoint, _) = manifest_fields(manifest, &package.id)?;
         if archive::hash(manifest) != package.manifest_sha256
+            || package.manifest != strict::parse(manifest)?
             || package.name != package_name(&package.id, &version, architecture)
             || files
                 .get("SOURCE.json")
@@ -1771,6 +1776,7 @@ mod build_tests {
                 id: (*id).to_owned(),
                 name,
                 manifest_sha256: archive::hash(manifest),
+                manifest: strict::parse(manifest).unwrap(),
                 artifact: Artifact {
                     os: "linux".into(),
                     architecture: architecture.into(),

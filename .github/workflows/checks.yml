@@ -69,6 +69,74 @@ jobs:
           cargo +1.98.1 vendor --locked --versioned-dirs --sync tools/among-tools/Cargo.toml vendor > dist/vendor-config.toml
           tools/among-tools/target/debug/among-tools plugin-packages "$PWD" "$PWD/target/release" "$PWD/vendor" "$PWD/dist/${{ matrix.architecture }}"
           (cd "dist/${{ matrix.architecture }}" && sha256sum -c SHA256SUMS)
+      - name: Package the plugins the way a release does, for the version check
+        run: |
+          set -euo pipefail
+          # A release packages with author-packages and a vendor tree of this
+          # crate alone, so the version check compares the same kind of package
+          # (same members) that the previous release's catalogue lists.
+          cargo +1.98.1 vendor --locked --versioned-dirs dist/vendor-author > /dev/null
+          tools/among-tools/target/debug/among-tools author-packages "$PWD" "$PWD/target/release" "$PWD/dist/vendor-author" "${{ github.repository_id }}" "$PWD/dist/author-${{ matrix.architecture }}"
+      - name: Plugin versions match what changed since the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          build="dist/author-${{ matrix.architecture }}/build.json"
+          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
+          # An ordinary change leaves the versions to the release change and is
+          # checked as pending: changed content at the previous version passes.
+          # A release change is checked strictly, so every changed plugin must
+          # carry a raised version. It is recognised by its branch, by its pull
+          # request title and by the commit it becomes on the default branch;
+          # names and titles are all this step looks at.
+          mode=(--pending)
+          case "${GITHUB_HEAD_REF:-}" in release/*) mode=() ;; esac
+          case "$PULL_REQUEST_TITLE" in 'chore(release): '*) mode=() ;; esac
+          case "$COMMIT_MESSAGE" in 'chore(release): '*) mode=() ;; esac
+          "$tool" changed-plugins "${mode[@]}" "$RUNNER_TEMP/previous-catalogue.json" "$build"
+      - name: The changed-plugin check separates same content from changed content
+        run: |
+          set -euo pipefail
+          # A catalogue made from this very build is the previous release of a
+          # build whose content did not change: it must pass. Changing one
+          # executable digest in the build without raising its version must fail.
+          tool="$PWD/tools/among-tools/target/debug/among-tools"
+          build="dist/author-${{ matrix.architecture }}/build.json"
+          baseline="$RUNNER_TEMP/baseline-catalogue.json"
+          jq '{schema_version: 2, plugins: [.packages[] | {id: .manifest.id, versions: [{manifest, artifacts: [.artifact]}]}]}' "$build" > "$baseline"
+          "$tool" changed-plugins "$baseline" "$build"
+          mutated="$RUNNER_TEMP/mutated-build.json"
+          jq '(.packages[0].artifact.members[] | select(.executable) | .sha256) = ("0" * 64)' "$build" > "$mutated"
+          if "$tool" changed-plugins "$baseline" "$mutated" > "$RUNNER_TEMP/mutated.log" 2>&1; then
+            echo "a changed executable without a version raise was accepted" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/mutated.log"
+          grep -E '^FAIL .*: packaged content changed .* the version is still ' "$RUNNER_TEMP/mutated.log"
+          # The same change passes as a pending release. A version raise over
+          # unchanged content fails in both modes, with the exact reason.
+          "$tool" changed-plugins --pending "$baseline" "$mutated"
+          raised="$RUNNER_TEMP/raised-build.json"
+          jq '.packages[0].manifest.version = "99.0.0"' "$build" > "$raised"
+          for mode in "" "--pending"; do
+            if "$tool" changed-plugins $mode "$baseline" "$raised" > "$RUNNER_TEMP/raised.log" 2>&1; then
+              echo "a version raise without a content change was accepted ($mode)" >&2
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/raised.log"
+            grep -E '^FAIL .*: version rose from .* but the packaged content is unchanged' "$RUNNER_TEMP/raised.log"
+          done
+      - name: Retain the build records the version check read
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: plugin-version-builds-${{ matrix.architecture }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/author-${{ matrix.architecture }}/build.json
+          if-no-files-found: error
+          retention-days: 14
       - name: A manifest without system.metrics is not packaged for the real binary
         run: |
           set -euo pipefail
