@@ -10,8 +10,11 @@
 // catalogue carries their previous entry over verbatim and points at the
 // immutable release that holds their files.
 
-use crate::changed::{differences, from_builds, from_catalogue, read_json, Plugin, Version};
-use crate::{catalogue, process, Result};
+use crate::changed::{
+    self, differences, fetch_previous, from_builds, from_catalogue, read_json, valid_repository,
+    Plugin, Version,
+};
+use crate::{archive, catalogue, process, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -239,13 +242,26 @@ pub(crate) fn plan(
                     write: true,
                 });
             }
-            (std::cmp::Ordering::Greater, true) => bumps.push(Bump {
-                plugin: id.clone(),
-                from: before.version.clone(),
-                to: now.version.clone(),
-                level: delta(&before.version, &now.version)?,
-                write: false,
-            }),
+            (std::cmp::Ordering::Greater, true) => {
+                // The manifest already carries a raised version, as on the
+                // release commit. It must be the one the commits call for.
+                let level = plugin_level(id, &ids, commits);
+                let expected = bump(&before.version, level)?;
+                if expected != now.version {
+                    return Err(format!(
+                        "{id}: version {} differs from the computed {expected} (from {})",
+                        now.version, before.version
+                    )
+                    .into());
+                }
+                bumps.push(Bump {
+                    plugin: id.clone(),
+                    from: before.version.clone(),
+                    to: now.version.clone(),
+                    level: delta(&before.version, &now.version)?,
+                    write: false,
+                });
+            }
         }
     }
     if bumps.is_empty() && new.is_empty() {
@@ -316,35 +332,90 @@ fn commits_since(root: &Path, tag: Option<&str>) -> Result<Vec<Commit>> {
 }
 
 #[derive(Clone, Copy)]
-pub struct Options<'a> {
+pub struct PlanArguments<'a> {
     pub root: &'a Path,
-    pub previous: &'a Path,
-    pub previous_tag: Option<&'a str>,
+    pub repository: &'a str,
     pub candidate: Option<u32>,
-    pub apply: bool,
     pub builds: &'a [&'a Path],
 }
 
-pub fn run_plan(options: &Options) -> Result<Plan> {
-    let previous = from_catalogue(&read_json(options.previous)?)?;
-    let builds = options
-        .builds
-        .iter()
-        .map(|path| read_json(path))
-        .collect::<Result<Vec<_>>>()?;
-    let current = from_builds(&builds)?;
-    let commits = commits_since(options.root, options.previous_tag)?;
-    let plan = plan(
-        &previous,
-        &current,
-        &commits,
-        options.previous_tag,
-        options.candidate,
-    )?;
-    if options.apply {
-        apply(options.root, &plan)?;
+// The build records must describe the commit that is checked out; plans made
+// from the packages of another commit would bump the wrong content.
+fn require_builds_at_head(root: &Path, builds: &[Value]) -> Result<()> {
+    let head = git(root, &["rev-parse", "HEAD"])?;
+    for build in builds {
+        if build["revision"].as_str() != Some(head.trim()) {
+            return Err(format!(
+                "a build record is for {}, not for the checked out {}",
+                build["revision"].as_str().unwrap_or("an unknown commit"),
+                head.trim()
+            )
+            .into());
+        }
     }
-    Ok(plan)
+    Ok(())
+}
+
+// The previous release is fetched here, once, so that its tag and its
+// catalogue cannot come from different releases.
+fn plan_against(
+    root: &Path,
+    previous_tag: Option<&str>,
+    previous_catalogue: &Value,
+    builds: &[Value],
+    candidate: Option<u32>,
+) -> Result<Plan> {
+    require_builds_at_head(root, builds)?;
+    let commits = commits_since(root, previous_tag)?;
+    plan(
+        &from_catalogue(previous_catalogue)?,
+        &from_builds(builds)?,
+        &commits,
+        previous_tag,
+        candidate,
+    )
+}
+
+fn read_builds(paths: &[&Path]) -> Result<Vec<Value>> {
+    paths.iter().map(|path| read_json(path)).collect()
+}
+
+pub fn run_plan(arguments: &PlanArguments) -> Result<Plan> {
+    let (tag, bytes) = fetch_previous(arguments.repository, None)?;
+    plan_against(
+        arguments.root,
+        tag.as_deref(),
+        &serde_json::from_slice(&bytes)?,
+        &read_builds(arguments.builds)?,
+        arguments.candidate,
+    )
+}
+
+// Writes `catalogue.json` and, when there is a previous release, its record
+// `release.json` into the new directory, so that a release can carry unchanged
+// plugins over from it. `exclude` leaves one tag out.
+pub fn write_previous_release(
+    repository: &str,
+    exclude: Option<&str>,
+    directory: &Path,
+) -> Result<()> {
+    let (tag, bytes) = fetch_previous(repository, exclude)?;
+    let record = tag
+        .as_deref()
+        .map(|tag| release_json(repository, &format!("releases/tags/{tag}")))
+        .transpose()?;
+    std::fs::create_dir(directory)?;
+    archive::write_new(&directory.join("catalogue.json"), &bytes)?;
+    match (tag, record) {
+        (Some(tag), Some(record)) => {
+            let mut text = serde_json::to_vec_pretty(&record)?;
+            text.push(b'\n');
+            archive::write_new(&directory.join("release.json"), &text)?;
+            eprintln!("previous release: {tag}");
+        }
+        _ => eprintln!("no published release has a catalogue: every plugin counts as new"),
+    }
+    Ok(())
 }
 
 // The label a commit on the default branch asks to be tagged with: the subject
@@ -437,8 +508,18 @@ fn description(plan: &Plan) -> String {
 // ordinary pull request checks run on it. It raises the manifests on a branch
 // `release/<label>`; merging the pull request is the owner's step, and it
 // creates no tag and no release.
-pub fn run_release_pr(options: &Options, dry_run: bool) -> Result<()> {
-    let root = options.root;
+pub fn run_release_pr(arguments: &PlanArguments, dry_run: bool) -> Result<()> {
+    release_pr_with(arguments, dry_run, run_plan)
+}
+
+// The planner is a parameter so that the guards and the clean-up can be tested
+// without GitHub.
+fn release_pr_with(
+    arguments: &PlanArguments,
+    dry_run: bool,
+    planner: impl Fn(&PlanArguments) -> Result<Plan>,
+) -> Result<()> {
+    let root = arguments.root;
     if !git(root, &["status", "--porcelain"])?.trim().is_empty() {
         return Err("the working tree is not clean".into());
     }
@@ -449,17 +530,43 @@ pub fn run_release_pr(options: &Options, dry_run: bool) -> Result<()> {
     if git(root, &["rev-parse", "HEAD"])? != git(root, &["rev-parse", "origin/main"])? {
         return Err("main is not equal to origin/main".into());
     }
-    let plan = run_plan(&Options {
-        apply: false,
-        ..*options
-    })?;
+    let plan = planner(arguments)?;
     print!("{}", description(&plan));
+    // A label that is already a tag, here or on the remote, is a release that
+    // exists; a pull request for it would be a second one.
+    if git(root, &["tag", "--list", &plan.label])?.trim() == plan.label
+        || !git(
+            root,
+            &[
+                "ls-remote",
+                "--tags",
+                "origin",
+                &format!("refs/tags/{}", plan.label),
+            ],
+        )?
+        .trim()
+        .is_empty()
+    {
+        return Err(format!("the tag {} already exists", plan.label).into());
+    }
     if dry_run {
         return Ok(());
     }
     let branch = format!("release/{}", plan.label);
     git(root, &["switch", "-c", &branch])?;
-    apply(root, &plan)?;
+    // From here every failure puts the working tree back on main, so that a
+    // retry starts from the state the operator began with.
+    let outcome = publish_branch(root, &plan, &branch);
+    if outcome.is_err() {
+        let _ = git(root, &["checkout", "-q", "--", "."]);
+        let _ = git(root, &["switch", "-q", "main"]);
+        let _ = git(root, &["branch", "-q", "-D", &branch]);
+    }
+    outcome
+}
+
+fn publish_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
+    apply(root, plan)?;
     let touched = git(root, &["diff", "--name-only"])?;
     if touched
         .lines()
@@ -470,29 +577,102 @@ pub fn run_release_pr(options: &Options, dry_run: bool) -> Result<()> {
     let title = format!("chore(release): {}", plan.label);
     git(
         root,
-        &[
-            "commit",
-            "-q",
-            "-a",
-            "-m",
-            &title,
-            "-m",
-            &description(&plan),
-        ],
+        &["commit", "-q", "-a", "-m", &title, "-m", &description(plan)],
     )?;
-    git(root, &["push", "-q", "-u", "origin", &branch])?;
+    git(root, &["push", "-q", "-u", "origin", branch])?;
     process::text(Command::new("gh").current_dir(root).args([
         "pr",
         "create",
         "--base",
         "main",
         "--head",
-        &branch,
+        branch,
         "--title",
         &title,
         "--body",
-        &description(&plan),
-    ]))?;
+        &description(plan),
+    ]))
+    .map_err(|error| {
+        format!("the branch {branch} was pushed but the pull request was not opened: {error}")
+    })?;
+    Ok(())
+}
+
+// The strict check of a release commit, run on the default branch before the
+// snapshot tag exists. The working tree is that commit. It confirms that the
+// commit is a release commit, that it changes nothing but the `version` line of
+// plugin manifests, that the build records are those of this very commit, that
+// every changed plugin carries a raised version, that the versions are those the
+// commits since the previous release call for, and that the label in the title is
+// the computed next label. It returns the label to tag.
+pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Result<String> {
+    let subject = git(root, &["show", "-s", "--format=%s", "HEAD"])?;
+    let files = git(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--no-renames",
+            "HEAD",
+        ],
+    )?;
+    let files: Vec<&str> = files.lines().collect();
+    let label =
+        snapshot_label(subject.trim_end(), &files)?.ok_or("the commit is not a release commit")?;
+    let diff = git(root, &["diff", "-U0", "HEAD^", "HEAD", "--", "plugins"])?;
+    only_version_lines(&diff)?;
+    let (tag, bytes) = fetch_previous(repository, Some(&label))?;
+    let catalogue: Value = serde_json::from_slice(&bytes)?;
+    let records = read_builds(builds)?;
+    require_builds_at_head(root, &records)?;
+    let report = changed::check(&catalogue, &records, false)?;
+    if report.failures > 0 {
+        return Err(format!(
+            "the strict version check fails:\n{}",
+            report.lines.join("\n")
+        )
+        .into());
+    }
+    let candidate = label
+        .split_once("-rc.")
+        .map(|(_, number)| number.parse::<u32>())
+        .transpose()?;
+    let plan = plan_against(root, tag.as_deref(), &catalogue, &records, candidate)?;
+    if plan.label != label {
+        return Err(format!(
+            "the release commit is titled {label} but the next label is {}",
+            plan.label
+        )
+        .into());
+    }
+    Ok(label)
+}
+
+// A unified diff (zero context) of the plugin directory that touches nothing
+// but `"version"` lines: every changed line is such a line, and removed and
+// added lines pair up.
+fn only_version_lines(diff: &str) -> Result<()> {
+    let (mut removed, mut added) = (0, 0);
+    for line in diff.lines() {
+        let (sign, content) = match line.split_at_checked(1) {
+            Some(("+", rest)) if !line.starts_with("+++") => (1, rest),
+            Some(("-", rest)) if !line.starts_with("---") => (-1, rest),
+            _ => continue,
+        };
+        if !content.trim_start().starts_with("\"version\":") {
+            return Err(format!("the release commit changes more than versions: {line}").into());
+        }
+        if sign > 0 {
+            added += 1;
+        } else {
+            removed += 1;
+        }
+    }
+    if added == 0 || added != removed {
+        return Err("the release commit must replace version lines one for one".into());
+    }
     Ok(())
 }
 
@@ -546,7 +726,7 @@ fn check_release(release: &Value, id: u64, tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn reference(version: &Value) -> Result<Option<(u64, String)>> {
+pub(crate) fn reference(version: &Value) -> Result<Option<(u64, String)>> {
     match version.get("release") {
         None => Ok(None),
         Some(release) => Ok(Some((
@@ -567,11 +747,11 @@ fn reference(version: &Value) -> Result<Option<(u64, String)>> {
 // a reference to it; an entry that already carries one keeps it. It is an error
 // when an unchanged plugin has no entry in the previous catalogue.
 pub(crate) fn carry_over(
-    previous: &Value,
-    previous_release: &Value,
+    previous: &Previous,
     fresh: &Value,
     unchanged: &BTreeSet<String>,
 ) -> Result<Value> {
+    let (previous_release, previous) = (&previous.release, &previous.catalogue);
     let id = previous_release["id"]
         .as_u64()
         .ok_or("previous release has no id")?;
@@ -626,69 +806,102 @@ fn release_json(repository: &str, path: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn repository_name(repository: &str) -> Result<()> {
-    if repository.split('/').count() != 2
-        || repository.starts_with('-')
-        || !repository
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./".contains(&byte))
-    {
-        return Err("repository must look like owner/name".into());
-    }
-    Ok(())
+// The previous release as a release carries it: its catalogue and its record.
+pub(crate) struct Previous {
+    pub(crate) catalogue: Value,
+    pub(crate) release: Value,
 }
 
-pub fn run_carry_over(
-    repository: &str,
-    previous: &Path,
+pub(crate) fn unchanged_in_builds(
+    previous: &Previous,
+    builds: &[Value],
+) -> Result<BTreeSet<String>> {
+    unchanged_ids(&from_catalogue(&previous.catalogue)?, &from_builds(builds)?)
+}
+
+// What a catalogue that carries plugins over must satisfy against the previous
+// catalogue it was made from: every entry with a `release` reference is the
+// previous entry byte for byte (parsed, compared without the reference), and its
+// reference is the previous entry's own, or the previous release when that entry
+// had none. Returns the releases it refers to.
+pub(crate) fn check_references(
+    catalogue: &Value,
+    previous_catalogue: &Value,
+    previous_id: u64,
     previous_tag: &str,
-    fresh: &Path,
-    output: &Path,
-    builds: &[&Path],
+) -> Result<BTreeSet<(u64, String)>> {
+    let mut referenced = BTreeSet::new();
+    for plugin in catalogue["plugins"]
+        .as_array()
+        .ok_or("catalogue has no plugins")?
+    {
+        let id = plugin["id"].as_str().ok_or("plugin has no id")?;
+        let [version] = plugin["versions"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        else {
+            return Err(format!("{id}: a release catalogue lists exactly one version").into());
+        };
+        let Some(found) = reference(version)? else {
+            continue;
+        };
+        let old = previous_catalogue["plugins"]
+            .as_array()
+            .and_then(|all| all.iter().find(|candidate| candidate["id"] == id))
+            .and_then(|entry| entry["versions"].as_array())
+            .and_then(|versions| versions.first())
+            .ok_or_else(|| format!("{id}: a carried plugin is not in the previous catalogue"))?;
+        let expected = reference(old)?.unwrap_or((previous_id, previous_tag.to_owned()));
+        if found != expected {
+            return Err(format!("{id}: the release reference is not the previous entry's").into());
+        }
+        let (mut now, mut before) = (version.clone(), old.clone());
+        now.as_object_mut()
+            .ok_or("version is not an object")?
+            .remove("release");
+        before
+            .as_object_mut()
+            .ok_or("version is not an object")?
+            .remove("release");
+        if now != before {
+            return Err(format!("{id}: the carried entry differs from the previous one").into());
+        }
+        referenced.insert(found);
+    }
+    Ok(referenced)
+}
+
+// `verify-references`: the catalogue's carried entries are the previous
+// release's, and every release they point at is published and immutable.
+pub fn run_verify_references(
+    repository: &str,
+    catalogue: &Path,
+    previous_catalogue: &Path,
+    previous_tag: &str,
 ) -> Result<()> {
-    repository_name(repository)?;
+    valid_repository(repository)?;
     if !catalogue::tag_name(previous_tag) {
         return Err(format!("`{previous_tag}` is not a usable tag name").into());
     }
-    let previous_catalogue = read_json(previous)?;
-    let builds = builds
-        .iter()
-        .map(|path| read_json(path))
-        .collect::<Result<Vec<_>>>()?;
-    let unchanged = unchanged_ids(
-        &from_catalogue(&previous_catalogue)?,
-        &from_builds(&builds)?,
+    let record = release_json(repository, &format!("releases/tags/{previous_tag}"))?;
+    let previous_id = record["id"].as_u64().ok_or("previous release has no id")?;
+    let referenced = check_references(
+        &read_json(catalogue)?,
+        &read_json(previous_catalogue)?,
+        previous_id,
+        previous_tag,
     )?;
-    let release = release_json(repository, &format!("releases/tags/{previous_tag}"))?;
-    let result = carry_over(
-        &previous_catalogue,
-        &release,
-        &read_json(fresh)?,
-        &unchanged,
-    )?;
-    // Every release the new catalogue points at, the previous one included,
-    // must still be a published immutable release.
-    let mut referenced = BTreeSet::new();
-    for plugin in result["plugins"].as_array().into_iter().flatten() {
-        for version in plugin["versions"].as_array().into_iter().flatten() {
-            if let Some(found) = reference(version)? {
-                referenced.insert(found);
-            }
-        }
-    }
-    for (id, tag) in referenced {
+    for (id, tag) in &referenced {
         check_release(
             &release_json(repository, &format!("releases/{id}"))?,
-            id,
-            &tag,
+            *id,
+            tag,
         )?;
     }
-    let mut bytes = serde_json::to_vec_pretty(&result)?;
-    bytes.push(b'\n');
-    crate::archive::write_new(output, &bytes)?;
     println!(
-        "carried over: {}",
-        unchanged.into_iter().collect::<Vec<_>>().join(", ")
+        "{} release(s) referenced, all published and immutable",
+        referenced.len()
     );
     Ok(())
 }
@@ -864,10 +1077,13 @@ mod tests {
 
     #[test]
     fn an_already_raised_version_is_kept_and_not_rewritten() {
+        // The release commit: the manifest already holds the version the
+        // commits call for (a feature, so 0.3.0), and the label follows it.
+        let commits = [commit("feat(clock): x")];
         let plan = planned(
             &[("clock", "0.2.0", "a")],
-            &[("clock", "0.4.0", "a2")],
-            &[],
+            &[("clock", "0.3.0", "a2")],
+            &commits,
             Some("v0.2.0"),
         )
         .unwrap();
@@ -876,6 +1092,16 @@ mod tests {
             (false, Level::Minor)
         );
         assert_eq!(plan.label, "v0.3.0");
+        // A hand-picked version that the commits do not call for is refused.
+        let error = planned(
+            &[("clock", "0.2.0", "a")],
+            &[("clock", "0.4.0", "a2")],
+            &commits,
+            Some("v0.2.0"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("differs from the computed 0.3.0"), "{error}");
     }
 
     #[test]
@@ -901,9 +1127,59 @@ mod tests {
         );
     }
 
+    /// A directory unique to one test that is removed when the test ends,
+    /// whether it passes or fails.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let number = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "among-release-{name}-{}-{number}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs git in `root` with no user configuration, so that a developer's
+    /// signing or hooks cannot change what a test does.
+    fn run_git(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
     #[test]
     fn apply_changes_only_the_version_text() {
-        let root = std::env::temp_dir().join(format!("among-release-apply-{}", std::process::id()));
+        let scratch = TempDir::new("apply");
+        let root = scratch.0.clone();
         let directory = root.join("plugins/clock");
         std::fs::create_dir_all(&directory).unwrap();
         let file = directory.join("among-plugin.json");
@@ -931,33 +1207,13 @@ mod tests {
         );
         // A second application finds no `0.2.0` to replace and refuses.
         assert!(apply(&root, &plan).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn commits_are_read_from_the_previous_tag_to_head() {
-        let root = std::env::temp_dir().join(format!("among-release-git-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let run = |arguments: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args([
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@invalid",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "-c",
-                    "tag.gpgsign=false",
-                ])
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(arguments)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{arguments:?}");
-        };
+        let scratch = TempDir::new("git");
+        let root = scratch.0.clone();
+        let run = |arguments: &[&str]| run_git(&root, arguments);
         run(&["init", "-q"]);
         run(&[
             "commit",
@@ -983,7 +1239,162 @@ mod tests {
         assert!(commits[0].breaking);
         assert!(commits_since(&root, None).unwrap().is_empty());
         assert!(commits_since(&root, Some("--all")).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A clone of a bare remote on `main` with one plugin manifest, as the
+    /// operator of a release pull request has it.
+    fn release_fixture(name: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let scratch = TempDir::new(name);
+        let (remote, work) = (scratch.0.join("remote.git"), scratch.0.join("work"));
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "-q", "--bare"]);
+        std::fs::create_dir_all(work.join("plugins/clock")).unwrap();
+        run_git(&work, &["init", "-q"]);
+        run_git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::write(
+            work.join("plugins/clock/among-plugin.json"),
+            "{\n  \"id\": \"clock\",\n  \"version\": \"0.2.0\"\n}\n",
+        )
+        .unwrap();
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-q", "-m", "feat: start"]);
+        run_git(&work, &["push", "-q", "-u", "origin", "main"]);
+        (scratch, remote, work)
+    }
+
+    fn fixed_plan() -> Plan {
+        Plan {
+            label: "v0.2.1".into(),
+            bumps: vec![Bump {
+                plugin: "clock".into(),
+                from: "0.2.0".into(),
+                to: "0.2.1".into(),
+                level: Level::Patch,
+                write: true,
+            }],
+            unchanged: vec![],
+            new: vec![],
+        }
+    }
+
+    fn open_release_pr(work: &Path, dry_run: bool) -> Result<()> {
+        let arguments = PlanArguments {
+            root: work,
+            repository: "Among-Terminal/among-plugins",
+            candidate: None,
+            builds: &[],
+        };
+        release_pr_with(&arguments, dry_run, |_| Ok(fixed_plan()))
+    }
+
+    fn branches(work: &Path) -> String {
+        git(work, &["branch", "--list"]).unwrap()
+    }
+
+    #[test]
+    fn a_release_pull_request_is_refused_from_a_dirty_tree_another_branch_or_a_stale_main() {
+        let (_scratch, _remote, work) = release_fixture("guards");
+        std::fs::write(work.join("stray.txt"), "x").unwrap();
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(error.contains("not clean"), "{error}");
+        std::fs::remove_file(work.join("stray.txt")).unwrap();
+
+        run_git(
+            &work,
+            &["commit", "-q", "--allow-empty", "-m", "fix: unpushed"],
+        );
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(error.contains("not equal to origin/main"), "{error}");
+        run_git(&work, &["reset", "-q", "--hard", "origin/main"]);
+
+        run_git(&work, &["switch", "-q", "-c", "topic"]);
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(error.contains("from main"), "{error}");
+        assert!(!branches(&work).contains("release/"));
+    }
+
+    #[test]
+    fn a_release_pull_request_is_refused_when_the_tag_exists_locally_or_on_the_remote() {
+        let (_scratch, _remote, work) = release_fixture("tags");
+        run_git(&work, &["tag", "v0.2.1"]);
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(error.contains("v0.2.1 already exists"), "{error}");
+        // Only on the remote: pushed, then deleted locally.
+        run_git(&work, &["push", "-q", "origin", "v0.2.1"]);
+        run_git(&work, &["tag", "-d", "v0.2.1"]);
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(error.contains("v0.2.1 already exists"), "{error}");
+        assert!(!branches(&work).contains("release/"));
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing() {
+        let (_scratch, _remote, work) = release_fixture("dry");
+        open_release_pr(&work, true).unwrap();
+        assert!(!branches(&work).contains("release/"));
+        assert!(git(&work, &["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_push_puts_the_working_tree_back_on_main() {
+        let (_scratch, remote, work) = release_fixture("push");
+        // The remote refuses every push from now on.
+        let hook = remote.join("hooks/pre-receive");
+        std::fs::create_dir_all(remote.join("hooks")).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let error = open_release_pr(&work, false).unwrap_err().to_string();
+        assert!(
+            error.contains("push") || error.contains("subprocess failed"),
+            "{error}"
+        );
+        assert_eq!(
+            git(&work, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "main"
+        );
+        assert!(!branches(&work).contains("release/"));
+        assert!(git(&work, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(work.join("plugins/clock/among-plugin.json")).unwrap(),
+            "{\n  \"id\": \"clock\",\n  \"version\": \"0.2.0\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn build_records_must_describe_the_checked_out_commit() {
+        let (_scratch, _remote, work) = release_fixture("builds");
+        let head = git(&work, &["rev-parse", "HEAD"]).unwrap();
+        let record = |revision: &str| json!({"revision": revision, "packages": []});
+        assert!(require_builds_at_head(&work, &[record(head.trim())]).is_ok());
+        let error = require_builds_at_head(&work, &[record(head.trim()), record(&"0".repeat(40))])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not for the checked out"), "{error}");
+        assert!(require_builds_at_head(&work, &[json!({"packages": []})]).is_err());
+    }
+
+    #[test]
+    fn a_release_commit_may_change_only_version_lines() {
+        let clean =
+            "diff --git a/plugins/clock/among-plugin.json b/plugins/clock/among-plugin.json\n\
+            --- a/plugins/clock/among-plugin.json\n+++ b/plugins/clock/among-plugin.json\n\
+            @@ -3 +3 @@\n-  \"version\": \"0.2.0\",\n+  \"version\": \"0.2.1\",\n";
+        assert!(only_version_lines(clean).is_ok());
+        let extra = format!("{clean}-  \"name\": \"Clock\",\n+  \"name\": \"Clocks\",\n");
+        assert!(only_version_lines(&extra).is_err());
+        let unpaired = format!("{clean}+  \"version\": \"9.9.9\",\n");
+        assert!(only_version_lines(&unpaired).is_err());
+        assert!(only_version_lines("").is_err());
+        let renamed_key = "-  \"version\": \"0.2.0\",\n+  \"versions\": \"0.2.1\",\n";
+        assert!(only_version_lines(renamed_key).is_err());
     }
 
     #[test]
@@ -1033,14 +1444,27 @@ mod tests {
         json!({"id": id, "tag_name": tag, "draft": draft, "immutable": immutable})
     }
 
+    fn carry(
+        catalogue: &Value,
+        record: Value,
+        fresh: &Value,
+        unchanged: &BTreeSet<String>,
+    ) -> Result<Value> {
+        let previous = Previous {
+            catalogue: catalogue.clone(),
+            release: record,
+        };
+        carry_over(&previous, fresh, unchanged)
+    }
+
     #[test]
     fn unchanged_plugins_keep_their_previous_entry_and_point_at_its_release() {
         let previous = catalogue_of(&[("clock", "0.2.0", "a"), ("pane-pwd", "0.2.0", "b")]);
         let fresh = catalogue_of(&[("clock", "0.2.0", "REBUILT"), ("pane-pwd", "0.2.1", "b2")]);
         let unchanged = BTreeSet::from(["clock".to_owned()]);
-        let result = carry_over(
+        let result = carry(
             &previous,
-            &release(7, "v0.2.0", false, true),
+            release(7, "v0.2.0", false, true),
             &fresh,
             &unchanged,
         )
@@ -1061,9 +1485,9 @@ mod tests {
         previous["plugins"][0]["versions"][0]["release"] = json!({"id": 3, "tag": "v0.2.0"});
         let fresh = catalogue_of(&[("clock", "0.2.0", "REBUILT")]);
         let unchanged = BTreeSet::from(["clock".to_owned()]);
-        let result = carry_over(
+        let result = carry(
             &previous,
-            &release(9, "v0.2.1", false, true),
+            release(9, "v0.2.1", false, true),
             &fresh,
             &unchanged,
         )
@@ -1080,20 +1504,20 @@ mod tests {
         let fresh = catalogue_of(&[("clock", "0.2.0", "x"), ("pane-pwd", "0.2.0", "y")]);
         let good = release(7, "v0.2.0", false, true);
         let missing = BTreeSet::from(["pane-pwd".to_owned()]);
-        assert!(carry_over(&previous, &good, &fresh, &missing).is_err());
+        assert!(carry(&previous, good.clone(), &fresh, &missing).is_err());
         let absent = BTreeSet::from(["system-status".to_owned()]);
-        assert!(carry_over(&previous, &good, &fresh, &absent).is_err());
+        assert!(carry(&previous, good, &fresh, &absent).is_err());
         let unchanged = BTreeSet::from(["clock".to_owned()]);
-        assert!(carry_over(
+        assert!(carry(
             &previous,
-            &release(7, "v0.2.0", true, true),
+            release(7, "v0.2.0", true, true),
             &fresh,
             &unchanged
         )
         .is_err());
-        assert!(carry_over(
+        assert!(carry(
             &previous,
-            &release(7, "v0.2.0", false, false),
+            release(7, "v0.2.0", false, false),
             &fresh,
             &unchanged
         )

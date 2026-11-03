@@ -424,8 +424,12 @@ pub fn run(previous: &Path, builds: &[&Path], pending: bool) -> Result<()> {
 // The newest published release, a prerelease included, whose assets contain a
 // catalogue. A prerelease counts because its bytes are already out: the host
 // refuses the same version with different bytes. Drafts are not published and
-// are skipped. GitHub lists releases newest first.
+// are skipped. Among the candidates of one page the newest is the one with the
+// latest `published_at` (an ISO 8601 UTC time, so text order is time order),
+// ties broken by the larger release id; the order GitHub lists them in is not
+// relied on.
 fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
+    let mut best: Option<(String, u64, String)> = None;
     for release in releases.as_array().ok_or("release list is not an array")? {
         if release["draft"]
             .as_bool()
@@ -438,17 +442,50 @@ fn newest_with_catalogue(releases: &Value) -> Result<Option<String>> {
             .ok_or("release has no asset list")?
             .iter()
             .any(|asset| asset["name"] == CATALOGUE_ASSET);
-        if has {
-            return Ok(Some(text(release, "tag_name")?.to_owned()));
+        if !has {
+            continue;
+        }
+        let key = (
+            text(release, "published_at")?.to_owned(),
+            release["id"].as_u64().ok_or("release has no id")?,
+            text(release, "tag_name")?.to_owned(),
+        );
+        if best
+            .as_ref()
+            .is_none_or(|known| (&key.0, key.1) > (&known.0, known.1))
+        {
+            best = Some(key);
         }
     }
-    Ok(None)
+    Ok(best.map(|(_, _, tag)| tag))
 }
 
-// Writes the catalogue of the previous release to `output`; when there is none
-// the output is an empty schema 2 catalogue, so every plugin counts as new.
-pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
+// The most pages of 100 releases that are read looking for a catalogue. A
+// repository with more releases than this and none with a catalogue in them is
+// reported instead of being treated as having no previous release.
+const MAX_RELEASE_PAGES: u32 = 20;
+
+// Reads release pages until one holds a published release with a catalogue.
+fn newest_across_pages(mut page: impl FnMut(u32) -> Result<Value>) -> Result<Option<String>> {
+    for number in 1..=MAX_RELEASE_PAGES {
+        let releases = page(number)?;
+        if releases
+            .as_array()
+            .ok_or("release list is not an array")?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        if let Some(tag) = newest_with_catalogue(&releases)? {
+            return Ok(Some(tag));
+        }
+    }
+    Err(format!("no release with a catalogue in the newest {MAX_RELEASE_PAGES} pages").into())
+}
+
+pub(crate) fn valid_repository(repository: &str) -> Result<()> {
     if repository.split('/').count() != 2
+        || repository.split('/').any(str::is_empty)
         || repository.starts_with('-')
         || !repository
             .bytes()
@@ -456,20 +493,43 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
     {
         return Err("repository must look like owner/name".into());
     }
-    let releases = process::capture(
-        Command::new("gh").args([
-            "api",
-            "--hostname",
-            "github.com",
-            &format!("repos/{repository}/releases?per_page=100"),
-        ]),
-        &[],
-        8 * MAX_CATALOGUE_BYTES,
-    )?;
-    let newest = newest_with_catalogue(&serde_json::from_slice(&releases)?)?;
+    Ok(())
+}
+
+// The tag of the previous release and its catalogue bytes, or no tag and an
+// empty schema 2 catalogue when there is no release with a catalogue. The tag
+// and the catalogue come from the same release by construction.
+// `exclude` leaves one tag out, so that a run for a tag that already has a
+// release does not take that release for its own predecessor.
+pub(crate) fn fetch_previous(
+    repository: &str,
+    exclude: Option<&str>,
+) -> Result<(Option<String>, Vec<u8>)> {
+    valid_repository(repository)?;
+    let newest = newest_across_pages(|number| {
+        let releases = process::capture(
+            Command::new("gh").args([
+                "api",
+                "--hostname",
+                "github.com",
+                &format!("repos/{repository}/releases?per_page=100&page={number}"),
+            ]),
+            &[],
+            8 * MAX_CATALOGUE_BYTES,
+        )?;
+        let mut releases: Value = serde_json::from_slice(&releases)?;
+        // A page that holds only the excluded release must not read as the end.
+        if let (Some(tag), Some(list)) = (exclude, releases.as_array_mut()) {
+            let before = list.len();
+            list.retain(|release| release["tag_name"] != tag);
+            if before > 0 && list.is_empty() {
+                list.push(json!({"tag_name": "", "draft": true, "assets": []}));
+            }
+        }
+        Ok(releases)
+    })?;
     let bytes = match &newest {
         Some(tag) => {
-            eprintln!("previous release: {tag}");
             let bytes = process::capture(
                 Command::new("gh").args([
                     "release",
@@ -489,13 +549,23 @@ pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
             bytes
         }
         None => {
-            eprintln!("no published release has a catalogue: every plugin counts as new");
             let mut empty =
                 serde_json::to_vec_pretty(&json!({"schema_version": 2, "plugins": []}))?;
             empty.push(b'\n');
             empty
         }
     };
+    Ok((newest, bytes))
+}
+
+// Writes the catalogue of the previous release to `output`; when there is none
+// the output is an empty schema 2 catalogue, so every plugin counts as new.
+pub fn previous_catalogue(repository: &str, output: &Path) -> Result<()> {
+    let (newest, bytes) = fetch_previous(repository, None)?;
+    match &newest {
+        Some(tag) => eprintln!("previous release: {tag}"),
+        None => eprintln!("no published release has a catalogue: every plugin counts as new"),
+    }
     archive::write_new(output, &bytes)?;
     // The tag of the previous release on stdout (an empty line when there is
     // none), for the release planner.
@@ -775,31 +845,112 @@ mod tests {
 
     #[test]
     fn the_previous_release_is_the_newest_published_one_with_a_catalogue() {
-        let release = |tag: &str, draft: bool, prerelease: bool, asset: &str| {
-            json!({"tag_name": tag, "draft": draft, "prerelease": prerelease,
+        let release = |tag: &str, id: u64, at: &str, draft: bool, asset: &str| {
+            json!({"tag_name": tag, "id": id, "published_at": at, "draft": draft,
                    "assets": [{"name": asset}, {"name": "clock-linux-amd64.tar.gz"}]})
         };
+        // The list is deliberately not in time order: the newest by
+        // `published_at` wins wherever it sits, drafts and releases without a
+        // catalogue never do.
         let list = json!([
-            release("v0.3.0", true, false, CATALOGUE_ASSET),
-            release("v0.2.1", false, false, "other.json"),
-            release("v0.2.0-rc.1", false, true, CATALOGUE_ASSET),
-            release("v0.1.0", false, false, CATALOGUE_ASSET),
+            release("v0.1.0", 1, "2026-01-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("v0.3.0", 9, "2026-09-01T00:00:00Z", true, CATALOGUE_ASSET),
+            release("v0.2.1", 8, "2026-08-01T00:00:00Z", false, "other.json"),
+            release(
+                "v0.2.0-rc.1",
+                5,
+                "2026-05-01T00:00:00Z",
+                false,
+                CATALOGUE_ASSET
+            ),
+            release(
+                "v0.2.0-rc.2",
+                6,
+                "2026-06-01T00:00:00Z",
+                false,
+                CATALOGUE_ASSET
+            ),
         ]);
         assert_eq!(
             newest_with_catalogue(&list).unwrap().as_deref(),
-            Some("v0.2.0-rc.1")
+            Some("v0.2.0-rc.2")
         );
+        // The same instant is broken by the larger release id.
+        let tie = json!([
+            release("a", 4, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("b", 7, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+            release("c", 3, "2026-05-01T00:00:00Z", false, CATALOGUE_ASSET),
+        ]);
+        assert_eq!(newest_with_catalogue(&tie).unwrap().as_deref(), Some("b"));
         assert_eq!(newest_with_catalogue(&json!([])).unwrap(), None);
         assert_eq!(
-            newest_with_catalogue(&json!([release("v1", true, false, CATALOGUE_ASSET)])).unwrap(),
+            newest_with_catalogue(&json!([release(
+                "v1",
+                1,
+                "2026-01-01T00:00:00Z",
+                true,
+                CATALOGUE_ASSET
+            )]))
+            .unwrap(),
             None
         );
     }
 
     #[test]
-    fn a_repository_name_with_option_syntax_is_refused() {
-        assert!(previous_catalogue("--version", Path::new("/nonexistent/out")).is_err());
-        assert!(previous_catalogue("--version/x", Path::new("/nonexistent/out")).is_err());
-        assert!(previous_catalogue("a/b/c", Path::new("/nonexistent/out")).is_err());
+    fn pages_are_read_until_a_release_with_a_catalogue_is_found() {
+        let plain = |tag: &str| {
+            json!({"tag_name": tag, "id": 1, "published_at": "2026-01-01T00:00:00Z",
+                   "draft": false, "assets": [{"name": "other.json"}]})
+        };
+        let with = json!({"tag_name": "v0.2.0", "id": 2, "published_at": "2026-02-01T00:00:00Z",
+                          "draft": false, "assets": [{"name": CATALOGUE_ASSET}]});
+        let mut asked = Vec::new();
+        let found = newest_across_pages(|number| {
+            asked.push(number);
+            Ok(match number {
+                1 => json!([plain("a"), plain("b")]),
+                2 => json!([plain("c"), with.clone()]),
+                _ => panic!("read past the page that has a catalogue"),
+            })
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("v0.2.0"));
+        assert_eq!(asked, [1, 2]);
+        // An empty page is the end of the list.
+        assert_eq!(
+            newest_across_pages(|n| Ok(if n == 1 {
+                json!([plain("a")])
+            } else {
+                json!([])
+            }))
+            .unwrap(),
+            None
+        );
+        // Endless pages without a catalogue are an error, not "no release".
+        assert!(newest_across_pages(|_| Ok(json!([plain("a")]))).is_err());
+        assert!(newest_across_pages(|_| Err("network".into())).is_err());
+    }
+
+    #[test]
+    fn repository_names_are_validated_before_any_process_starts() {
+        for bad in [
+            "--version",
+            "--version/x",
+            "-x/y",
+            "a/b/c",
+            "a",
+            "/b",
+            "a/",
+            "a b/c",
+            "a/b;rm",
+        ] {
+            assert!(valid_repository(bad).is_err(), "{bad}");
+        }
+        assert!(valid_repository("Among-Terminal/among-plugins").is_ok());
+        // The fetching entry points reject the same names without a network call;
+        // a missing `gh` would otherwise show up as a different error.
+        let error = fetch_previous("-x/y", None).unwrap_err().to_string();
+        assert_eq!(error, "repository must look like owner/name");
+        assert!(previous_catalogue("-x/y", Path::new("/nonexistent/out")).is_err());
     }
 }

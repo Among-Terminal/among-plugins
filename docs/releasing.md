@@ -61,17 +61,23 @@ data without `version`). Across three commits with unchanged plugin code, only t
 members differed.
 
 The previous release is the newest published release, a prerelease included, that has an
-`among-plugins.json` asset; drafts are skipped. A prerelease counts because its bytes are
-already out. When no release has a catalogue, every plugin counts as new and the check
-passes. `checks.yml` runs it on every pull request, after packaging, and a second step
-proves on the real build that unchanged content passes and a changed executable without a
-version raise fails.
+`among-plugins.json` asset; drafts are skipped. "Newest" is the latest `published_at`
+(ties go to the larger release id), not the order GitHub lists them in, and release pages
+are read, 100 at a time, until a release with a catalogue turns up. A prerelease counts
+because its bytes are already out. When no release has a catalogue, every plugin counts as
+new and the check passes. `checks.yml` runs it on every pull request, after packaging, and
+further steps prove on the real build that unchanged content passes, that a changed
+executable without a version raise fails, and that a version raise over unchanged content
+fails with the reason `packaged content is unchanged`.
 
-An ordinary pull request does not raise versions: the release pull request below does, once,
-for every plugin that changed. So the check runs with `--pending` there, which accepts
-changed content at the previous version and still refuses a raise without a change or a
-lower version. On a release branch (`release/<label>`) it runs strict and requires every
-changed plugin to carry a raised version.
+There are two modes. The default is strict: changed content must come with a raised
+version. An ordinary pull request does not raise versions (the release pull request does,
+once, for every plugin that changed), so `checks.yml` runs `--pending` for it: changed
+content at the previous version passes, while a raise without a change or a lower version
+still fails. The run is strict for a release: a branch `release/<label>`, a pull request
+titled `chore(release): ...`, or a push to the default branch whose commit title starts
+that way. A title is only a hint, so the release commit is verified again before it is
+tagged.
 
 ```sh
 among-tools previous-catalogue Among-Terminal/among-plugins previous-catalogue.json

@@ -19,7 +19,7 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools check-plugin-packages <source-root> <package-directory>
        among-tools plugin-catalogue <source-root> <amd64-package-directory> <arm64-package-directory> <release-id> <new-output>
        among-tools author-packages <source-root> <native-binary-directory> <vendor-directory> <repository-id> <new-output>
-       among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output>
+       among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output> [--previous <previous-catalogue.json> <previous-release.json>]
        among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
        among-tools prepared-run <run.json> <artifact.json> <repository-id> <source> <run-id> <artifact-id> <workflow-ref>
        among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
@@ -27,27 +27,30 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools resolve-tag <repository-id> <tag>
        among-tools previous-catalogue <owner/name> <new-output>
        among-tools changed-plugins [--pending] <previous-catalogue.json> <build.json>...
-       among-tools plugin-release-plan <repo-root> <previous-catalogue.json> <previous-tag>|- [--rc N] [--apply] <build.json>...
-       among-tools plugin-release-pr <repo-root> <previous-catalogue.json> <previous-tag>|- [--rc N] [--dry-run] <build.json>...
-       among-tools snapshot-label <commit-subject> [<changed-file>...]
-       among-tools carry-over <owner/name> <previous-catalogue.json> <previous-tag> <fresh-catalogue.json> <new-output> <build.json>...";
+       among-tools previous-release <owner/name> <exclude-tag>|- <new-directory>
+       among-tools plugin-release-plan <repo-root> <owner/name> [--rc N] <build.json>...
+       among-tools plugin-release-pr <repo-root> <owner/name> [--rc N] [--dry-run] <build.json>...
+       among-tools snapshot-verify <repo-root> <owner/name> <build.json>...
+       among-tools verify-references <owner/name> <catalogue.json> <previous-catalogue.json> <previous-tag>";
 
-// `[--rc N] [--apply] [--dry-run] <build.json>...` after the three fixed
-// arguments of the release planning commands.
-fn release_options<'a>(
+// `[--rc N] [--dry-run] <build.json>...` after the two fixed arguments of the
+// release planning commands. `--dry-run` is accepted only where it means
+// something.
+fn release_arguments<'a>(
     arguments: &'a [String],
+    dry_run_allowed: bool,
     paths: &'a mut Vec<&'a Path>,
-) -> Result<(release::Options<'a>, bool)> {
-    let [root, previous, tag, rest @ ..] = arguments else {
+) -> Result<(release::PlanArguments<'a>, bool)> {
+    let [root, repository, rest @ ..] = arguments else {
         return Err(USAGE.into());
     };
-    let (mut candidate, mut apply, mut dry_run) = (None, false, false);
+    let (mut candidate, mut dry_run) = (None, false);
     let mut rest = rest.iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--rc" => candidate = Some(rest.next().ok_or(USAGE)?.parse()?),
-            "--apply" => apply = true,
-            "--dry-run" => dry_run = true,
+            "--dry-run" if dry_run_allowed => dry_run = true,
+            flag if flag.starts_with("--") => return Err(USAGE.into()),
             path => paths.push(Path::new(path)),
         }
     }
@@ -55,12 +58,10 @@ fn release_options<'a>(
         return Err(USAGE.into());
     }
     Ok((
-        release::Options {
+        release::PlanArguments {
             root: Path::new(root),
-            previous: Path::new(previous),
-            previous_tag: (tag != "-").then_some(tag.as_str()),
+            repository,
             candidate,
-            apply,
             builds: paths,
         },
         dry_run,
@@ -116,9 +117,16 @@ fn run() -> Result<()> {
                 Path::new(output),
             )
         }
-        [command, amd64, arm64, repository, tag, revision, output]
+        [command, amd64, arm64, repository, tag, revision, output, rest @ ..]
             if command == "author-catalogue" =>
         {
+            let previous = match rest {
+                [] => None,
+                [flag, catalogue, release] if flag == "--previous" => {
+                    Some((Path::new(catalogue), Path::new(release)))
+                }
+                _ => return Err(USAGE.into()),
+            };
             author::catalogue(
                 Path::new(amd64),
                 Path::new(arm64),
@@ -126,6 +134,7 @@ fn run() -> Result<()> {
                 tag,
                 revision,
                 Path::new(output),
+                previous,
             )
         }
         [command, inventory, workflow, run, output] if command == "release-binding" => {
@@ -204,36 +213,41 @@ fn run() -> Result<()> {
             let builds: Vec<_> = builds.iter().map(Path::new).collect();
             changed::run(Path::new(previous), &builds, false)
         }
+        [command, repository, exclude, directory] if command == "previous-release" => {
+            release::write_previous_release(
+                repository,
+                (exclude != "-").then_some(exclude.as_str()),
+                Path::new(directory),
+            )
+        }
         [command, rest @ ..] if command == "plugin-release-plan" => {
             let mut paths = Vec::new();
-            let (options, _) = release_options(rest, &mut paths)?;
-            let plan = release::run_plan(&options)?;
+            let (arguments, _) = release_arguments(rest, false, &mut paths)?;
+            let plan = release::run_plan(&arguments)?;
             println!("{}", serde_json::to_string_pretty(&plan.to_json())?);
             Ok(())
         }
         [command, rest @ ..] if command == "plugin-release-pr" => {
             let mut paths = Vec::new();
-            let (options, dry_run) = release_options(rest, &mut paths)?;
-            release::run_release_pr(&options, dry_run)
+            let (arguments, dry_run) = release_arguments(rest, true, &mut paths)?;
+            release::run_release_pr(&arguments, dry_run)
         }
-        [command, subject, files @ ..] if command == "snapshot-label" => {
-            let files: Vec<_> = files.iter().map(String::as_str).collect();
-            if let Some(label) = release::snapshot_label(subject, &files)? {
-                println!("{label}");
-            }
-            Ok(())
-        }
-        [command, repository, previous, tag, fresh, output, builds @ ..]
-            if command == "carry-over" && !builds.is_empty() =>
+        [command, root, repository, builds @ ..]
+            if command == "snapshot-verify" && !builds.is_empty() =>
         {
             let builds: Vec<_> = builds.iter().map(Path::new).collect();
-            release::run_carry_over(
+            println!(
+                "{}",
+                release::snapshot_verify(Path::new(root), repository, &builds)?
+            );
+            Ok(())
+        }
+        [command, repository, catalogue, previous, tag] if command == "verify-references" => {
+            release::run_verify_references(
                 repository,
+                Path::new(catalogue),
                 Path::new(previous),
                 tag,
-                Path::new(fresh),
-                Path::new(output),
-                &builds,
             )
         }
         _ => Err(USAGE.into()),

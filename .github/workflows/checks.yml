@@ -72,16 +72,24 @@ jobs:
       - name: Plugin versions match what changed since the previous release
         env:
           GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
           tool="$PWD/tools/among-tools/target/debug/among-tools"
           build="dist/${{ matrix.architecture }}/build.json"
           "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
-          # An ordinary pull request changes content and leaves the versions to
-          # the release pull request (branch release/<label>), which must show
-          # every changed plugin at a raised version.
+          # An ordinary change leaves the versions to the release pull request
+          # and is checked as pending: changed content at the previous version
+          # passes. The release itself is checked strictly, so every changed
+          # plugin must carry a raised version. A release is recognised by its
+          # branch, by its pull request title and by the commit it becomes on
+          # the default branch; a title is only a hint here, because the
+          # release commit is verified again before it is tagged.
           mode=(--pending)
           case "${GITHUB_HEAD_REF:-}" in release/*) mode=() ;; esac
+          case "$PULL_REQUEST_TITLE" in 'chore(release): '*) mode=() ;; esac
+          case "$COMMIT_MESSAGE" in 'chore(release): '*) mode=() ;; esac
           "$tool" changed-plugins "${mode[@]}" "$RUNNER_TEMP/previous-catalogue.json" "$build"
       - name: The changed-plugin check separates same content from changed content
         run: |
@@ -102,15 +110,19 @@ jobs:
           fi
           cat "$RUNNER_TEMP/mutated.log"
           grep -E '^FAIL .*: packaged content changed .* the version is still ' "$RUNNER_TEMP/mutated.log"
-          # The same change passes as a pending release, and a version raise
-          # over unchanged content still fails.
+          # The same change passes as a pending release. A version raise over
+          # unchanged content fails in both modes, with the exact reason.
           "$tool" changed-plugins --pending "$baseline" "$mutated"
           raised="$RUNNER_TEMP/raised-build.json"
           jq '.packages[0].manifest.version = "99.0.0"' "$build" > "$raised"
-          if "$tool" changed-plugins --pending "$baseline" "$raised" > /dev/null 2>&1; then
-            echo "a version raise without a content change was accepted" >&2
-            exit 1
-          fi
+          for mode in "" "--pending"; do
+            if "$tool" changed-plugins $mode "$baseline" "$raised" > "$RUNNER_TEMP/raised.log" 2>&1; then
+              echo "a version raise without a content change was accepted ($mode)" >&2
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/raised.log"
+            grep -E '^FAIL .*: version rose from .* but the packaged content is unchanged' "$RUNNER_TEMP/raised.log"
+          done
       - name: A manifest without system.metrics is not packaged for the real binary
         run: |
           set -euo pipefail
