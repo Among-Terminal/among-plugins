@@ -87,13 +87,12 @@ jobs:
           tool="$PWD/tools/among-tools/target/debug/among-tools"
           build="dist/author-${{ matrix.architecture }}/build.json"
           "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
-          # An ordinary change leaves the versions to the release pull request
-          # and is checked as pending: changed content at the previous version
-          # passes. The release itself is checked strictly, so every changed
-          # plugin must carry a raised version. A release is recognised by its
-          # branch, by its pull request title and by the commit it becomes on
-          # the default branch; a title is only a hint here, because the
-          # release commit is verified again before it is tagged.
+          # An ordinary change leaves the versions to the release change and is
+          # checked as pending: changed content at the previous version passes.
+          # A release change is checked strictly, so every changed plugin must
+          # carry a raised version. It is recognised by its branch, by its pull
+          # request title and by the commit it becomes on the default branch;
+          # names and titles are all this step looks at.
           mode=(--pending)
           case "${GITHUB_HEAD_REF:-}" in release/*) mode=() ;; esac
           case "$PULL_REQUEST_TITLE" in 'chore(release): '*) mode=() ;; esac
