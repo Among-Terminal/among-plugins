@@ -1818,6 +1818,16 @@ mod tests {
         run_git(&remote, &["init", "-q", "--bare"]);
         std::fs::create_dir_all(work.join("plugins/clock")).unwrap();
         run_git(&work, &["init", "-q"]);
+        // The code under test runs plain `git` in this repository, so the
+        // identity and the signing choice must be the repository's own.
+        for (key, value) in [
+            ("user.name", "t"),
+            ("user.email", "t@invalid"),
+            ("commit.gpgsign", "false"),
+            ("tag.gpgsign", "false"),
+        ] {
+            run_git(&work, &["config", key, value]);
+        }
         run_git(
             &work,
             &["remote", "add", "origin", remote.to_str().unwrap()],
@@ -1973,10 +1983,8 @@ mod tests {
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let error = open_release_pr(&work, false).unwrap_err().to_string();
-        assert!(
-            error.contains("push") || error.contains("subprocess failed"),
-            "{error}"
-        );
+        // The push itself was refused by the remote, not something earlier.
+        assert!(error.contains("pre-receive hook declined"), "{error}");
         assert_eq!(
             git(&work, &["rev-parse", "--abbrev-ref", "HEAD"])
                 .unwrap()
