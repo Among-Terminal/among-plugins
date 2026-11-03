@@ -59,6 +59,10 @@ on:
         description: Publish a prerelease, which development mode installs and which never becomes the latest release.
         type: boolean
         default: false
+      candidate-tag:
+        description: Publish this stable tag from the bytes of the published release candidate with this tag (such as v0.2.0-rc.1 for v0.2.0). Requires the prepared inputs of the candidate's preparation.
+        type: string
+        default: ''
 
 jobs:
   pin:
@@ -87,9 +91,15 @@ jobs:
           PREPARED_RUN: ${{ inputs.prepared-run-id }}
           PREPARED_ARTIFACT: ${{ inputs.prepared-artifact-id }}
           PREPARED_DIGEST: ${{ inputs.prepared-sha256sums }}
+          CANDIDATE_TAG: ${{ inputs.candidate-tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           printf '%s' "$SHA" | grep -Eqx '[0-9a-f]{40}'
+          if [ -n "$CANDIDATE_TAG" ]; then
+            # Only a stable publication from prepared bytes names a candidate.
+            test "$PUBLISH" = true && test -n "$PREPARED_RUN" && test "$PRERELEASE" = false
+          fi
           if [ -n "$PREPARED_RUN$PREPARED_ARTIFACT$PREPARED_DIGEST" ]; then
             test "$PUBLISH" = true
             printf '%s' "$PREPARED_RUN" | grep -Eqx '[1-9][0-9]{0,19}'
@@ -116,6 +126,12 @@ jobs:
             *) echo "plugin releases run on a v* tag, not $REF" >&2; exit 1 ;;
           esac
           printf '%s' "$tag" | grep -Eqx '[A-Za-z0-9._-]{1,128}'
+          if [ -n "$CANDIDATE_TAG" ]; then
+            # v0.2.0 may be made from v0.2.0-rc.N and from nothing else.
+            case "$tag" in *-*) echo "a candidate-tag needs a stable tag, not $tag" >&2; exit 1 ;; esac
+            test "${CANDIDATE_TAG%-rc.*}" = "$tag"
+            printf '%s' "${CANDIDATE_TAG##*-rc.}" | grep -Eqx '[1-9][0-9]{0,8}'
+          fi
           # Peel annotated tags through the API of the numeric repository.
           kind=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.type)
           object=$(gh api "repositories/$REPOSITORY_ID/git/ref/tags/$tag" --jq .object.sha)
@@ -440,6 +456,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           CARRY_TAG: ${{ needs.pin.outputs.carry_tag }}
+          CANDIDATE_TAG: ${{ inputs.candidate-tag }}
           REPOSITORY_ID: ${{ github.repository_id }}
           PIN: ${{ needs.pin.outputs.commit }}
           TAG: ${{ needs.pin.outputs.tag }}
@@ -457,13 +474,18 @@ jobs:
           if [ "$PRERELEASE" = true ]; then channel=prerelease; else channel=stable; fi
           inventory="$PWD/release/inventory.json"
           # The previous release as it is now, the one unchanged plugins are
-          # carried over from. A prepared candidate is checked against it again:
-          # if another release was published since the preparation, the carried
-          # entries no longer match and publication stops.
+          # carried over from: the last stable release for a stable tag, the
+          # newest release for a candidate. A prepared release is checked
+          # against it again: if another release was published since the
+          # preparation, the carried entries no longer match and publication
+          # stops. A stable release made from a release candidate is none of
+          # this: it must be the candidate's bytes, checked below.
           previous=()
-          "$tool" previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
-          if [ -f previous/release.json ]; then
-            previous=(--previous previous/catalogue.json previous/release.json)
+          if [ -z "$CANDIDATE_TAG" ]; then
+            "$tool" previous-release "$GITHUB_REPOSITORY" "$CARRY_TAG" previous
+            if [ -f previous/release.json ]; then
+              previous=(--previous previous/catalogue.json previous/release.json)
+            fi
           fi
           if [ "$PREPARED" = true ]; then
             jq -e --arg repository "$REPOSITORY_ID" --arg source "$PIN" --arg run "$PREPARED_RUN" \
@@ -475,7 +497,11 @@ jobs:
           else
             "$tool" author-catalogue build/amd64 build/arm64 "$REPOSITORY_ID" "$TAG" "$PIN" release "${previous[@]}"
           fi
-          if [ "${#previous[@]}" -gt 0 ]; then
+          if [ -n "$CANDIDATE_TAG" ]; then
+            # The stable release is the candidate's bytes at the candidate's
+            # commit: same assets, same catalogue, same revision.
+            "$tool" verify-candidate "$GITHUB_REPOSITORY" "$CANDIDATE_TAG" "$TAG" "$inventory"
+          elif [ "${#previous[@]}" -gt 0 ]; then
             "$tool" verify-references "$GITHUB_REPOSITORY" release/assets/among-plugins.json \
               previous/catalogue.json "$(jq -r .tag_name previous/release.json)"
           elif jq -e '[.plugins[].versions[] | select(has("release"))] | length > 0' release/assets/among-plugins.json > /dev/null; then

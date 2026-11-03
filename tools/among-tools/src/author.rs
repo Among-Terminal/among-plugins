@@ -762,7 +762,7 @@ pub fn binding(inventory: &Path, workflow_ref: &str, run_id: u64, output: &Path)
     archive::write_new(output, line.as_bytes())
 }
 
-fn read_inventory(path: &Path) -> Result<Inventory> {
+pub(crate) fn read_inventory(path: &Path) -> Result<Inventory> {
     Ok(serde_json::from_value(strict::parse(&archive::read(
         path,
         1024 * 1024,
@@ -1014,7 +1014,7 @@ pub fn prepared_inventory(
     archive::json(output, &inventory)
 }
 
-fn body_binding(release: &Value) -> Result<Binding> {
+pub(crate) fn body_binding(release: &Value) -> Result<Binding> {
     let body = release["body"].as_str().unwrap_or_default();
     let mut lines = body
         .lines()

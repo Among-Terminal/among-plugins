@@ -25,13 +25,15 @@ const USAGE: &str = "Usage: among-tools plugin-packages <source-root> <native-bi
        among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
        among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
        among-tools resolve-tag <repository-id> <tag>
-       among-tools previous-catalogue <owner/name> <new-output>
+       among-tools previous-catalogue <owner/name> <new-output> [--stable-only]
        among-tools changed-plugins [--pending] <previous-catalogue.json> <build.json>...
        among-tools previous-release <owner/name> <exclude-tag>|- <new-directory>
        among-tools plugin-release-plan <repo-root> <owner/name> [--rc N] <build.json>...
        among-tools plugin-release-pr <repo-root> <owner/name> [--rc N] [--dry-run] <build.json>...
        among-tools snapshot-verify <repo-root> <owner/name> <build.json>...
-       among-tools verify-references <owner/name> <catalogue.json> <previous-catalogue.json> <previous-tag>";
+       among-tools verify-references <owner/name> <catalogue.json> <previous-catalogue.json> <previous-tag>
+       among-tools promote-candidate <owner/name> <candidate-tag>
+       among-tools verify-candidate <owner/name> <candidate-tag> <stable-tag> <inventory.json>";
 
 // `[--rc N] [--dry-run] <build.json>...` after the two fixed arguments of the
 // release planning commands. `--dry-run` is accepted only where it means
@@ -201,7 +203,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         [command, repository, output] if command == "previous-catalogue" => {
-            changed::previous_catalogue(repository, Path::new(output))
+            changed::previous_catalogue(repository, Path::new(output), false)
+        }
+        [command, repository, output, flag]
+            if command == "previous-catalogue" && flag == "--stable-only" =>
+        {
+            changed::previous_catalogue(repository, Path::new(output), true)
         }
         [command, flag, previous, builds @ ..]
             if command == "changed-plugins" && flag == "--pending" && !builds.is_empty() =>
@@ -241,6 +248,12 @@ fn run() -> Result<()> {
                 release::snapshot_verify(Path::new(root), repository, &builds)?
             );
             Ok(())
+        }
+        [command, repository, candidate] if command == "promote-candidate" => {
+            release::run_promote(repository, candidate)
+        }
+        [command, repository, candidate, stable, inventory] if command == "verify-candidate" => {
+            release::run_verify_candidate(repository, candidate, stable, Path::new(inventory))
         }
         [command, repository, catalogue, previous, tag] if command == "verify-references" => {
             release::run_verify_references(

@@ -381,7 +381,8 @@ fn read_builds(paths: &[&Path]) -> Result<Vec<Value>> {
 }
 
 pub fn run_plan(arguments: &PlanArguments) -> Result<Plan> {
-    let (tag, bytes) = fetch_previous(arguments.repository, None)?;
+    // Without --rc the release is stable and is compared with the last stable one.
+    let (tag, bytes) = fetch_previous(arguments.repository, None, arguments.candidate.is_none())?;
     plan_against(
         arguments.root,
         tag.as_deref(),
@@ -399,7 +400,10 @@ pub fn write_previous_release(
     exclude: Option<&str>,
     directory: &Path,
 ) -> Result<()> {
-    let (tag, bytes) = fetch_previous(repository, exclude)?;
+    // The tag being released decides the baseline: a stable tag (no hyphen)
+    // takes the last stable release, a candidate the newest of any kind.
+    let stable_only = exclude.is_some_and(|tag| !tag.contains('-'));
+    let (tag, bytes) = fetch_previous(repository, exclude, stable_only)?;
     let record = tag
         .as_deref()
         .map(|tag| release_json(repository, &format!("releases/tags/{tag}")))
@@ -606,8 +610,29 @@ fn publish_branch(root: &Path, plan: &Plan, branch: &str) -> Result<()> {
 // commits since the previous release call for, and that the label in the title is
 // the computed next label. It returns the label to tag.
 pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Result<String> {
+    let label = release_commit_label(root)?;
+    // A stable release is compared with the last stable one, a candidate with
+    // the newest release of any kind.
+    let (tag, bytes) = fetch_previous(repository, Some(&label), !label.contains('-'))?;
+    verify_release_commit(
+        root,
+        tag.as_deref(),
+        &serde_json::from_slice(&bytes)?,
+        &read_builds(builds)?,
+    )
+}
+
+// The label of the checked out commit if it is a release commit.
+fn release_commit_label(root: &Path) -> Result<String> {
     let subject = git(root, &["show", "-s", "--format=%s", "HEAD"])?;
-    let files = git(
+    let files = changed_files(root)?;
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+    snapshot_label(subject.trim_end(), &files)?
+        .ok_or_else(|| "the commit is not a release commit".into())
+}
+
+fn changed_files(root: &Path) -> Result<Vec<String>> {
+    Ok(git(
         root,
         &[
             "diff-tree",
@@ -617,17 +642,23 @@ pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Resul
             "--no-renames",
             "HEAD",
         ],
-    )?;
-    let files: Vec<&str> = files.lines().collect();
-    let label =
-        snapshot_label(subject.trim_end(), &files)?.ok_or("the commit is not a release commit")?;
-    let diff = git(root, &["diff", "-U0", "HEAD^", "HEAD", "--", "plugins"])?;
-    only_version_lines(&diff)?;
-    let (tag, bytes) = fetch_previous(repository, Some(&label))?;
-    let catalogue: Value = serde_json::from_slice(&bytes)?;
-    let records = read_builds(builds)?;
-    require_builds_at_head(root, &records)?;
-    let report = changed::check(&catalogue, &records, false)?;
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect())
+}
+
+// `snapshot_verify` without the network: the previous release is a parameter.
+fn verify_release_commit(
+    root: &Path,
+    previous_tag: Option<&str>,
+    previous_catalogue: &Value,
+    records: &[Value],
+) -> Result<String> {
+    let label = release_commit_label(root)?;
+    only_versions_changed(root, &changed_files(root)?)?;
+    require_builds_at_head(root, records)?;
+    let report = changed::check(previous_catalogue, records, false)?;
     if report.failures > 0 {
         return Err(format!(
             "the strict version check fails:\n{}",
@@ -639,7 +670,7 @@ pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Resul
         .split_once("-rc.")
         .map(|(_, number)| number.parse::<u32>())
         .transpose()?;
-    let plan = plan_against(root, tag.as_deref(), &catalogue, &records, candidate)?;
+    let plan = plan_against(root, previous_tag, previous_catalogue, records, candidate)?;
     if plan.label != label {
         return Err(format!(
             "the release commit is titled {label} but the next label is {}",
@@ -650,28 +681,35 @@ pub fn snapshot_verify(root: &Path, repository: &str, builds: &[&Path]) -> Resul
     Ok(label)
 }
 
-// A unified diff (zero context) of the plugin directory that touches nothing
-// but `"version"` lines: every changed line is such a line, and removed and
-// added lines pair up.
-fn only_version_lines(diff: &str) -> Result<()> {
-    let (mut removed, mut added) = (0, 0);
-    for line in diff.lines() {
-        let (sign, content) = match line.split_at_checked(1) {
-            Some(("+", rest)) if !line.starts_with("+++") => (1, rest),
-            Some(("-", rest)) if !line.starts_with("---") => (-1, rest),
-            _ => continue,
-        };
-        if !content.trim_start().starts_with("\"version\":") {
-            return Err(format!("the release commit changes more than versions: {line}").into());
-        }
-        if sign > 0 {
-            added += 1;
-        } else {
-            removed += 1;
-        }
+// Each manifest the release commit changed must differ from its parent's only
+// in `version`, compared as parsed JSON (so formatting and key order do not
+// matter and a changed key or value anywhere else does).
+fn only_versions_changed(root: &Path, files: &[String]) -> Result<()> {
+    if files.is_empty() {
+        return Err("the release commit changes no manifest".into());
     }
-    if added == 0 || added != removed {
-        return Err("the release commit must replace version lines one for one".into());
+    for file in files {
+        let parse = |revision: &str| -> Result<Value> {
+            let text = git(root, &["show", &format!("{revision}:{file}")])
+                .map_err(|_| format!("{file} does not exist in {revision}"))?;
+            Ok(serde_json::from_str(&text)?)
+        };
+        let (mut before, mut after) = (parse("HEAD^")?, parse("HEAD")?);
+        let versions = (before["version"].clone(), after["version"].clone());
+        for manifest in [&mut before, &mut after] {
+            manifest
+                .as_object_mut()
+                .ok_or_else(|| format!("{file} is not a JSON object"))?
+                .remove("version");
+        }
+        if before != after {
+            return Err(
+                format!("the release commit changes more than the version of {file}").into(),
+            );
+        }
+        if versions.0 == versions.1 {
+            return Err(format!("the release commit does not change the version of {file}").into());
+        }
     }
     Ok(())
 }
@@ -812,6 +850,227 @@ fn release_json(repository: &str, path: &str) -> Result<Value> {
         4 * 1024 * 1024,
     )?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+// A stable release made from a release candidate. The application installs a
+// candidate in development mode and offers the stable release of the same
+// version as an update only if the manifest digest, the package digest and the
+// commit the tag resolves to are the candidate's; anything else is refused as a
+// publisher inconsistency. So the stable release is not a new build: it is the
+// candidate's approved bytes, published again under the stable tag, which sits
+// on the candidate's commit.
+
+// `v0.2.0` for `v0.2.0-rc.1`.
+pub(crate) fn stable_label(candidate: &str) -> Result<String> {
+    let (stable, number) = candidate
+        .split_once("-rc.")
+        .ok_or_else(|| format!("`{candidate}` is not a release candidate tag"))?;
+    let core = stable
+        .strip_prefix('v')
+        .ok_or_else(|| format!("`{candidate}` does not start with v"))?;
+    if !Version::parse(core)?.pre.is_empty()
+        || number.is_empty()
+        || number.starts_with('0')
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("`{candidate}` is not a release candidate tag").into());
+    }
+    Ok(stable.to_owned())
+}
+
+fn release_assets(release: &Value) -> Result<BTreeMap<String, (u64, String)>> {
+    let mut found = BTreeMap::new();
+    for asset in release["assets"]
+        .as_array()
+        .ok_or("release lists no assets")?
+    {
+        let name = asset["name"].as_str().ok_or("asset has no name")?;
+        let digest = asset["digest"]
+            .as_str()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .ok_or_else(|| format!("asset {name} has no sha256 digest"))?;
+        if asset["state"] != "uploaded"
+            || found
+                .insert(
+                    name.to_owned(),
+                    (
+                        asset["size"].as_u64().ok_or("asset has no size")?,
+                        digest.to_owned(),
+                    ),
+                )
+                .is_some()
+        {
+            return Err(format!("asset {name} is not uploaded exactly once").into());
+        }
+    }
+    Ok(found)
+}
+
+// The prepared stable release must equal the published candidate: the same
+// repository and commit in its binding, the same asset names, sizes and
+// digests (so the same packages, source archive, catalogue and checksums).
+pub(crate) fn check_candidate(
+    candidate: &Value,
+    candidate_tag: &str,
+    inventory: &crate::author::Inventory,
+) -> Result<()> {
+    if candidate["tag_name"].as_str() != Some(candidate_tag)
+        || candidate["draft"].as_bool() != Some(false)
+        || candidate["prerelease"].as_bool() != Some(true)
+        || candidate["immutable"].as_bool() != Some(true)
+    {
+        return Err(format!("{candidate_tag} is not a published, immutable prerelease").into());
+    }
+    let binding = crate::author::body_binding(candidate)?;
+    if binding.repository_id != inventory.repository_id || binding.commit != inventory.revision {
+        return Err(format!(
+            "{candidate_tag} was built from {}, not from {}",
+            binding.commit, inventory.revision
+        )
+        .into());
+    }
+    let wanted: BTreeMap<_, _> = inventory
+        .assets
+        .iter()
+        .map(|asset| (asset.name.clone(), (asset.size, asset.sha256.clone())))
+        .collect();
+    let published = release_assets(candidate)?;
+    if wanted != published {
+        let differing: Vec<_> = wanted
+            .keys()
+            .chain(published.keys())
+            .filter(|name| wanted.get(*name) != published.get(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(5)
+            .collect();
+        return Err(format!(
+            "the stable release would differ from {candidate_tag} in: {}",
+            differing.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+// `verify-candidate`: the prepared inventory of the stable tag against the
+// published candidate, and the candidate's tag still on the same commit.
+pub fn run_verify_candidate(
+    repository: &str,
+    candidate_tag: &str,
+    stable_tag: &str,
+    inventory: &Path,
+) -> Result<()> {
+    valid_repository(repository)?;
+    if stable_label(candidate_tag)? != stable_tag {
+        return Err(format!("{candidate_tag} is not a candidate of {stable_tag}").into());
+    }
+    let inventory = crate::author::read_inventory(inventory)?;
+    let release = release_json(repository, &format!("releases/tags/{candidate_tag}"))?;
+    check_candidate(&release, candidate_tag, &inventory)?;
+    let resolved = catalogue::binding_in(
+        inventory.repository_id,
+        candidate_tag,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )?;
+    if resolved["commit"].as_str() != Some(inventory.revision.as_str()) {
+        return Err(format!("{candidate_tag} no longer points at {}", inventory.revision).into());
+    }
+    println!("{stable_tag} is {candidate_tag}: same commit, same assets");
+    Ok(())
+}
+
+// What the owner needs to publish the stable release from a candidate.
+fn promotion_text(
+    repository: &str,
+    candidate: &str,
+    stable: &str,
+    commit: &str,
+    approved_sha256sums: &str,
+    preparations: &[(u64, u64)],
+) -> String {
+    let mut text = format!(
+        "candidate {candidate} was built from {commit}\n\
+         stable tag {stable} goes on the same commit, with the same bytes:\n\n\
+         1. gh api repos/{repository}/git/refs -f ref=refs/tags/{stable} -f sha={commit}\n\
+         2. run `Official plugin candidate` on {stable} with publish=true, prerelease=false,\n\
+         \x20  candidate-tag={candidate}, prepared-sha256sums={approved_sha256sums} and a preparation:\n"
+    );
+    for (run, artifact) in preparations {
+        text.push_str(&format!(
+            "     prepared-run-id={run} prepared-artifact-id={artifact}\n"
+        ));
+    }
+    if preparations.is_empty() {
+        text.push_str(
+            "     (no unexpired preparation artifact of this commit exists: the stable release\n\
+             \x20     cannot be published from the candidate's bytes any more; see the documentation)\n",
+        );
+    }
+    text
+}
+
+// `promote-candidate`: checks that a stable release can be made from a
+// published candidate and prints exactly how. It creates nothing.
+pub fn run_promote(repository: &str, candidate_tag: &str) -> Result<()> {
+    valid_repository(repository)?;
+    let stable = stable_label(candidate_tag)?;
+    match release_json(repository, &format!("git/ref/tags/{stable}")) {
+        Ok(_) => return Err(format!("the tag {stable} already exists").into()),
+        Err(error) if error.to_string().contains("HTTP 404") => {}
+        Err(error) => return Err(error),
+    }
+    let release = release_json(repository, &format!("releases/tags/{candidate_tag}"))?;
+    if release["tag_name"].as_str() != Some(candidate_tag)
+        || release["draft"].as_bool() != Some(false)
+        || release["prerelease"].as_bool() != Some(true)
+        || release["immutable"].as_bool() != Some(true)
+    {
+        return Err(format!("{candidate_tag} is not a published, immutable prerelease").into());
+    }
+    let binding = crate::author::body_binding(&release)?;
+    let resolved = catalogue::binding_in(
+        binding.repository_id,
+        candidate_tag,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )?;
+    if resolved["commit"].as_str() != Some(binding.commit.as_str()) {
+        return Err(format!("{candidate_tag} does not point at {}", binding.commit).into());
+    }
+    let artifacts = release_json(
+        repository,
+        &format!(
+            "actions/artifacts?name=plugin-release-candidate-{}&per_page=100",
+            binding.commit
+        ),
+    )?;
+    let preparations: Vec<(u64, u64)> = artifacts["artifacts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|artifact| {
+            artifact["expired"] == false && artifact["workflow_run"]["head_sha"] == binding.commit
+        })
+        .filter_map(|artifact| {
+            Some((
+                artifact["workflow_run"]["id"].as_u64()?,
+                artifact["id"].as_u64()?,
+            ))
+        })
+        .collect();
+    print!(
+        "{}",
+        promotion_text(
+            repository,
+            candidate_tag,
+            &stable,
+            &binding.commit,
+            &binding.inventory_sha256,
+            &preparations
+        )
+    );
+    Ok(())
 }
 
 // The previous release as a release carries it: its catalogue and its record.
@@ -1389,20 +1648,312 @@ mod tests {
         assert!(require_builds_at_head(&work, &[json!({"packages": []})]).is_err());
     }
 
+    /// A repository with one plugin: a start commit tagged `v0.2.0`, a feature
+    /// commit, and a release commit that replaces the manifest by
+    /// `release_manifest` under the title `subject`. Build records for it need
+    /// the commit, so it is returned too.
+    fn release_repo(
+        name: &str,
+        subject: &str,
+        release_manifest: &str,
+    ) -> (TempDir, std::path::PathBuf, String) {
+        let scratch = TempDir::new(name);
+        let work = scratch.0.join("work");
+        std::fs::create_dir_all(work.join("plugins/clock")).unwrap();
+        run_git(&work, &["init", "-q"]);
+        let file = work.join("plugins/clock/among-plugin.json");
+        std::fs::write(
+            &file,
+            "{\n  \"id\": \"clock\",\n  \"version\": \"0.2.0\",\n  \"name\": \"Clock\"\n}\n",
+        )
+        .unwrap();
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-q", "-m", "feat: start"]);
+        run_git(&work, &["tag", "v0.2.0"]);
+        run_git(
+            &work,
+            &["commit", "-q", "--allow-empty", "-m", "feat(clock): more"],
+        );
+        std::fs::write(&file, release_manifest).unwrap();
+        run_git(
+            &work,
+            &["commit", "-q", "-a", "--allow-empty", "-m", subject],
+        );
+        let head = git(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        (scratch, work, head)
+    }
+
+    const RELEASED: &str =
+        "{\n  \"id\": \"clock\",\n  \"version\": \"0.3.0\",\n  \"name\": \"Clock\"\n}\n";
+
+    fn release_records(head: &str, version: &str, binary: &str) -> Vec<Value> {
+        let mut record = build_of(&[("clock", version, binary)]);
+        record["revision"] = json!(head);
+        vec![record]
+    }
+
     #[test]
-    fn a_release_commit_may_change_only_version_lines() {
-        let clean =
-            "diff --git a/plugins/clock/among-plugin.json b/plugins/clock/among-plugin.json\n\
-            --- a/plugins/clock/among-plugin.json\n+++ b/plugins/clock/among-plugin.json\n\
-            @@ -3 +3 @@\n-  \"version\": \"0.2.0\",\n+  \"version\": \"0.2.1\",\n";
-        assert!(only_version_lines(clean).is_ok());
-        let extra = format!("{clean}-  \"name\": \"Clock\",\n+  \"name\": \"Clocks\",\n");
-        assert!(only_version_lines(&extra).is_err());
-        let unpaired = format!("{clean}+  \"version\": \"9.9.9\",\n");
-        assert!(only_version_lines(&unpaired).is_err());
-        assert!(only_version_lines("").is_err());
-        let renamed_key = "-  \"version\": \"0.2.0\",\n+  \"versions\": \"0.2.1\",\n";
-        assert!(only_version_lines(renamed_key).is_err());
+    fn the_release_commit_is_verified_as_a_whole() {
+        let previous = catalogue_of(&[("clock", "0.2.0", "a")]);
+        let (_scratch, work, head) = release_repo("verify", "chore(release): v0.3.0", RELEASED);
+        let verified = verify_release_commit(
+            &work,
+            Some("v0.2.0"),
+            &previous,
+            &release_records(&head, "0.3.0", "a2"),
+        )
+        .unwrap();
+        assert_eq!(verified, "v0.3.0");
+
+        // The title names another label than the commits call for.
+        let (_s, wrong, head) = release_repo("verify-label", "chore(release): v0.4.0", RELEASED);
+        let error = verify_release_commit(
+            &wrong,
+            Some("v0.2.0"),
+            &previous,
+            &release_records(&head, "0.3.0", "a2"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("next label is v0.3.0"), "{error}");
+
+        // Build records of another commit.
+        let error = verify_release_commit(
+            &work,
+            Some("v0.2.0"),
+            &previous,
+            &release_records(&"0".repeat(40), "0.3.0", "a2"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not for the checked out"), "{error}");
+
+        // The packaged content changed but the build still shows the old version.
+        let error = verify_release_commit(
+            &work,
+            Some("v0.2.0"),
+            &previous,
+            &release_records(&head_of(&work), "0.2.0", "a2"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("strict version check"), "{error}");
+
+        // A commit that is not a release commit at all.
+        run_git(
+            &work,
+            &["commit", "-q", "--allow-empty", "-m", "fix: later"],
+        );
+        assert!(verify_release_commit(
+            &work,
+            Some("v0.2.0"),
+            &previous,
+            &release_records(&head_of(&work), "0.3.0", "a2"),
+        )
+        .is_err());
+    }
+
+    fn head_of(work: &Path) -> String {
+        git(work, &["rev-parse", "HEAD"]).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn a_release_commit_may_change_only_the_version_of_a_manifest() {
+        let previous = catalogue_of(&[("clock", "0.2.0", "a")]);
+        let check = |name: &str, manifest: &str| {
+            let (_scratch, work, head) = release_repo(name, "chore(release): v0.3.0", manifest);
+            verify_release_commit(
+                &work,
+                Some("v0.2.0"),
+                &previous,
+                &release_records(&head, "0.3.0", "a2"),
+            )
+        };
+        // Another field changed along with the version.
+        let renamed =
+            "{\n  \"id\": \"clock\",\n  \"version\": \"0.3.0\",\n  \"name\": \"Clocks\"\n}\n";
+        let error = check("only-name", renamed).unwrap_err().to_string();
+        assert!(error.contains("more than the version"), "{error}");
+        // A field added.
+        let added = "{\n  \"id\": \"clock\",\n  \"version\": \"0.3.0\",\n  \"name\": \"Clock\",\n  \"x\": 1\n}\n";
+        assert!(check("only-added", added).is_err());
+        // The version did not change.
+        let same = "{\"id\":\"clock\",\"version\":\"0.2.0\",\"name\":\"Clock\"}";
+        let error = check("only-same", same).unwrap_err().to_string();
+        assert!(error.contains("does not change the version"), "{error}");
+        // Another layout and key order is the same manifest.
+        let reformatted = "{\"name\":\"Clock\",\"version\":\"0.3.0\",\"id\":\"clock\"}";
+        assert!(check("only-layout", reformatted).is_ok());
+    }
+
+    fn candidate_release(commit: &str, digest: &str, immutable: bool) -> Value {
+        let binding = json!({"repository_id": 7, "workflow_ref": "w", "run_id": 1,
+            "tag": "v0.2.0-rc.1", "commit": commit, "inventory_sha256": "e".repeat(64)});
+        json!({"id": 5, "tag_name": "v0.2.0-rc.1", "draft": false, "prerelease": true,
+               "immutable": immutable,
+               "body": format!("{}{binding}", crate::author::BINDING_PREFIX),
+               "assets": [
+                   {"name": "among-plugins.json", "size": 10, "state": "uploaded", "digest": format!("sha256:{}", "1".repeat(64))},
+                   {"name": "clock-0.2.0-linux-amd64.tar.gz", "size": 20, "state": "uploaded", "digest": format!("sha256:{digest}")}]})
+    }
+
+    fn stable_inventory(commit: &str, digest: &str) -> crate::author::Inventory {
+        let asset = |name: &str, size: u64, sha256: String| crate::author::Asset {
+            name: name.to_owned(),
+            size,
+            sha256,
+        };
+        crate::author::Inventory {
+            repository_id: 7,
+            tag: "v0.2.0".into(),
+            revision: commit.to_owned(),
+            inventory_sha256: "e".repeat(64),
+            assets: vec![
+                asset("among-plugins.json", 10, "1".repeat(64)),
+                asset("clock-0.2.0-linux-amd64.tar.gz", 20, digest.to_owned()),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_stable_release_is_the_candidates_bytes_at_the_candidates_commit() {
+        let (commit, digest) = ("c".repeat(40), "2".repeat(64));
+        let candidate = candidate_release(&commit, &digest, true);
+        // 0.2.0-rc.1 -> 0.2.0 with no change at all: accepted.
+        assert!(check_candidate(
+            &candidate,
+            "v0.2.0-rc.1",
+            &stable_inventory(&commit, &digest)
+        )
+        .is_ok());
+        // One package built again (another digest): refused, naming the asset.
+        let error = check_candidate(
+            &candidate,
+            "v0.2.0-rc.1",
+            &stable_inventory(&commit, &"3".repeat(64)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("clock-0.2.0-linux-amd64.tar.gz"), "{error}");
+        // Another commit than the candidate was built from.
+        assert!(check_candidate(
+            &candidate,
+            "v0.2.0-rc.1",
+            &stable_inventory(&"d".repeat(40), &digest)
+        )
+        .is_err());
+        // An asset the stable release lacks or adds.
+        let mut fewer = stable_inventory(&commit, &digest);
+        fewer.assets.pop();
+        assert!(check_candidate(&candidate, "v0.2.0-rc.1", &fewer).is_err());
+        let mut more = stable_inventory(&commit, &digest);
+        more.assets.push(crate::author::Asset {
+            name: "SHA256SUMS".into(),
+            size: 1,
+            sha256: "4".repeat(64),
+        });
+        assert!(check_candidate(&candidate, "v0.2.0-rc.1", &more).is_err());
+        // Not a published immutable prerelease.
+        assert!(check_candidate(
+            &candidate_release(&commit, &digest, false),
+            "v0.2.0-rc.1",
+            &stable_inventory(&commit, &digest)
+        )
+        .is_err());
+        let mut draft = candidate.clone();
+        draft["draft"] = json!(true);
+        assert!(
+            check_candidate(&draft, "v0.2.0-rc.1", &stable_inventory(&commit, &digest)).is_err()
+        );
+        let mut stable_release = candidate.clone();
+        stable_release["prerelease"] = json!(false);
+        assert!(check_candidate(
+            &stable_release,
+            "v0.2.0-rc.1",
+            &stable_inventory(&commit, &digest)
+        )
+        .is_err());
+        assert!(check_candidate(
+            &candidate,
+            "v0.2.0-rc.2",
+            &stable_inventory(&commit, &digest)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_stable_label_of_a_candidate_and_the_instructions_for_it() {
+        assert_eq!(stable_label("v0.2.0-rc.1").unwrap(), "v0.2.0");
+        assert_eq!(stable_label("v1.10.3-rc.12").unwrap(), "v1.10.3");
+        for bad in [
+            "v0.2.0",
+            "v0.2.0-rc.0",
+            "v0.2.0-rc.01",
+            "v0.2.0-rc.",
+            "v0.2.0-beta.1",
+            "0.2.0-rc.1",
+            "v0.2-rc.1",
+            "v0.2.0-1-rc.1",
+        ] {
+            assert!(stable_label(bad).is_err(), "{bad}");
+        }
+        let text = promotion_text(
+            "Among-Terminal/among-plugins",
+            "v0.2.0-rc.1",
+            "v0.2.0",
+            &"c".repeat(40),
+            &"e".repeat(64),
+            &[(9, 99)],
+        );
+        assert!(
+            text.contains("-f ref=refs/tags/v0.2.0 -f sha=cccc"),
+            "{text}"
+        );
+        assert!(text.contains("candidate-tag=v0.2.0-rc.1"));
+        assert!(text.contains("prepared-run-id=9 prepared-artifact-id=99"));
+        let none = promotion_text(
+            "o/r",
+            "v0.2.0-rc.1",
+            "v0.2.0",
+            &"c".repeat(40),
+            &"e".repeat(64),
+            &[],
+        );
+        assert!(none.contains("no unexpired preparation artifact"));
+    }
+
+    #[test]
+    fn a_stable_release_after_a_candidate_with_no_changes_is_planned_from_the_stable_baseline() {
+        // Only the candidate 0.2.0-rc.1 is published; the stable release 0.2.0
+        // has the same plugin versions and the same content.
+        let candidate_catalogue = catalogue_of(&[("clock", "0.2.0", "a")]);
+        let current = build_of(&[("clock", "0.2.0", "a")]);
+        // Compared with the candidate nothing changed, so nothing could be released.
+        let error = plan(
+            &from_catalogue(&candidate_catalogue).unwrap(),
+            &from_builds(std::slice::from_ref(&current)).unwrap(),
+            &[],
+            Some("v0.2.0-rc.1"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nothing to release"), "{error}");
+        // The candidate is not the baseline of a stable release (the release
+        // selection tests in `changed` cover that), so there is no previous
+        // release and the plugins are new: the first label, v0.2.0.
+        let stable = plan(
+            &BTreeMap::new(),
+            &from_builds(&[current]).unwrap(),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((stable.label.as_str(), stable.new.len()), ("v0.2.0", 1));
     }
 
     #[test]

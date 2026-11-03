@@ -86,7 +86,16 @@ jobs:
           set -euo pipefail
           tool="$PWD/tools/among-tools/target/debug/among-tools"
           build="dist/author-${{ matrix.architecture }}/build.json"
-          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json"
+          # The label of a release, if this is one: a stable label (no hyphen)
+          # is compared with the last stable release, not with its candidates.
+          label=""
+          case "${GITHUB_HEAD_REF:-}" in release/*) label="${GITHUB_HEAD_REF#release/}" ;; esac
+          title="${PULL_REQUEST_TITLE:-$COMMIT_MESSAGE}"
+          title="${title%%$'\n'*}"
+          case "$title" in 'chore(release): '*) label="${title#chore(release): }"; label="${label%% *}" ;; esac
+          baseline=()
+          if [ -n "$label" ] && [ "${label#*-}" = "$label" ]; then baseline=(--stable-only); fi
+          "$tool" previous-catalogue "$GITHUB_REPOSITORY" "$RUNNER_TEMP/previous-catalogue.json" "${baseline[@]}"
           # An ordinary change leaves the versions to the release pull request
           # and is checked as pending: changed content at the previous version
           # passes. The release itself is checked strictly, so every changed
