@@ -22,14 +22,16 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           pattern='^(feat|fix|docs|test|ci|build|perf|refactor|chore)(\([A-Za-z0-9._/-]+\))?!?: [^[:space:]].*$'
+          # The title is never printed: the runner parses workflow commands
+          # (such as ##[error]) anywhere in a log line, so an echoed title could
+          # forge annotations.
           if [[ "$PR_TITLE" =~ $pattern ]]; then
-            echo "Title accepted: $PR_TITLE"
+            echo "Title accepted."
           else
             {
               echo "::error title=Invalid pull request title::The title must look like 'type(scope): summary'."
               echo "Allowed types: feat, fix, docs, test, ci, build, perf, refactor, chore."
               echo "The scope is optional; '!' before the colon marks a breaking change."
-              echo "Got: $PR_TITLE"
             } >&2
             exit 1
           fi
