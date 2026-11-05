@@ -297,6 +297,35 @@ Publishing and the owner's approval are separate steps that no pull request and 
 here performs; the only tag a workflow creates is the snapshot tag, after the owner has
 merged a release pull request and the commit has been verified again.
 
+#### Release 0.2.0 only
+
+The workflow file of a tag is the one that runs, and `v0.2.0-rc.1` was tagged before the
+description for people existed: its `official-plugin-release.yml` pins an older release
+workflow. The stable `v0.2.0` is made on the candidate's commit, so it runs that same old
+file, and its description is only the binding line. This is a one-time step after that
+publication; later releases run the current file and need none of it.
+
+1. Publish `v0.2.0` from the candidate as described above and check it.
+2. Replace only the description of the release, nothing else:
+   ```sh
+   gh api repos/Among-Terminal/among-plugins/releases/tags/v0.2.0 > release.json
+   jq -r .body release.json | grep '^among-release-binding: ' > binding   # exactly one line
+   # The candidate's preparation artifact holds inventory.json; the stable tag replaces its tag.
+   jq '.tag = "v0.2.0"' inventory.json > inventory-stable.json
+   among-tools release-notes Among-Terminal/among-plugins inventory-stable.json \
+     <downloaded>/among-plugins.json binding stable <preparation-run-id> notes.md
+   gh release edit v0.2.0 --repo Among-Terminal/among-plugins --notes-file notes.md
+   ```
+   Never pass assets, tag, title or the prerelease flag to `gh release edit`.
+3. Check that nothing but the description changed: fetch the release again and run
+   `among-tools verify-release stable published release.json inventory-stable.json binding latest.json`
+   (`latest.json` is `gh api repos/Among-Terminal/among-plugins/releases/latest`); the binding must be
+   the unchanged line, the tag must still resolve to the same commit and the asset digests must be
+   the same as before. GitHub accepted the same body-only edit of the immutable `v0.2.0-rc.1`.
+
+The candidate's preparation artifact is kept for 30 days; if it has expired, rebuild
+`inventory.json` from `SHA256SUMS` and the asset sizes of the published release.
+
 ## Native preparation
 
 Use Rust 1.98.1 with its matching `rust-docs`/`rust-src` components, binutils
