@@ -26,7 +26,7 @@ on:
         type: boolean
         default: false
       candidate-tag:
-        description: Publish a stable tag from the bytes of this published release candidate (such as v0.2.0-rc.1 for v0.2.0). Leave empty for a candidate or a first release.
+        description: Publish a stable tag from the bytes of this published release candidate (such as v0.2.0-rc.1 for v0.2.0). Leave empty for candidate publication; set it when promoting a stable tag that has a release candidate.
         type: string
         default: ''
 
