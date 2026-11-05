@@ -40,7 +40,7 @@ concurrency:
 jobs:
   prepare:
     if: ${{ !inputs.publish }}
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@a29deb1c7a196e8a8f66b96f09581f153f2e3809
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@83233ab9a6e2900679f5086edb207d6d0e0d4e44
     with:
       publish: false
 
@@ -75,7 +75,7 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@a29deb1c7a196e8a8f66b96f09581f153f2e3809
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@83233ab9a6e2900679f5086edb207d6d0e0d4e44
     with:
       publish: true
       candidate-tag: ${{ inputs.candidate-tag }}
