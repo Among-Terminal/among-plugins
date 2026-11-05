@@ -586,7 +586,12 @@ jobs:
             fi
             "$tool" verify-release "$channel" resume release.json "$inventory" binding > missing.txt
             # A draft of an earlier attempt may carry only the binding line.
-            gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F body=@notes.md > /dev/null
+            # The tag name must be sent again: an update of a draft that names
+            # only the body makes GitHub list the draft as `untagged-...`, so
+            # the upload below could not find it by tag and a later attempt
+            # would not find it as the draft of this tag.
+            gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" \
+              -f tag_name="$TAG" -F body=@notes.md > /dev/null
           else
             # Drafts cannot be latest; publishing below makes a stable release
             # latest, while a prerelease never becomes latest.
