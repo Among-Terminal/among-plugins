@@ -7,7 +7,7 @@ name: Snapshot tag
 # release commit again against the previous release as it is now before it
 # creates anything. It publishes nothing and does not start the release workflow:
 # preparing and publishing stay manual runs of `Official plugin candidate` on the
-# tag, until that workflow's pin includes carrying unchanged plugins over.
+# tag.
 #
 # A tag created with the workflow token starts no `push` workflow, so nothing
 # else reacts to the new tag.

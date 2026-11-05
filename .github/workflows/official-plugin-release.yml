@@ -25,6 +25,10 @@ on:
         description: Publish the approved bytes as a prerelease (a tag with a hyphen, such as v0.2.0-rc.1) for development-mode testing.
         type: boolean
         default: false
+      candidate-tag:
+        description: Publish a stable tag from the bytes of this published release candidate (such as v0.2.0-rc.1 for v0.2.0). Leave empty for candidate publication; set it when promoting a stable tag that has a release candidate.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ concurrency:
 jobs:
   prepare:
     if: ${{ !inputs.publish }}
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@a29deb1c7a196e8a8f66b96f09581f153f2e3809
     with:
       publish: false
 
@@ -71,9 +75,10 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@783c9b07d3a307e89260ae875987945d0885070a
+    uses: Among-Terminal/among-plugins/.github/workflows/plugin-release.yml@a29deb1c7a196e8a8f66b96f09581f153f2e3809
     with:
       publish: true
+      candidate-tag: ${{ inputs.candidate-tag }}
       prepared-run-id: ${{ inputs.prepared-run-id }}
       prepared-artifact-id: ${{ inputs.prepared-artifact-id }}
       prepared-sha256sums: ${{ inputs.prepared-sha256sums }}
