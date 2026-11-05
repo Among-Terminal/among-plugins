@@ -15,6 +15,7 @@ use std::{collections::BTreeSet, path::Path};
 const ARCHITECTURES: [&str; 2] = ["amd64", "arm64"];
 const SUMS: &str = "SHA256SUMS";
 const CATALOGUE: &str = "among-plugins.json";
+const OFFICIAL_REPOSITORY: &str = "Among-Terminal/among-plugins";
 
 /// Text that ends up in a Markdown table cell or an inline code span must not
 /// be able to break out of it, so only the characters of identifiers, versions
@@ -115,20 +116,25 @@ pub fn render(
         return Err("a release candidate is published as a prerelease".into());
     }
 
+    // Only this repository's own releases may call themselves official; the
+    // reusable workflow also publishes the releases of other plugin repositories.
+    let official = repository == OFFICIAL_REPOSITORY;
+    let what = if official {
+        "the official Among Terminal plugins".to_owned()
+    } else {
+        format!("the plugins of `{repository}`")
+    };
+
     let mut body = String::new();
     if candidate {
         body.push_str(&format!(
-            "`{tag}` is a **release candidate** of the official Among Terminal plugins. \
+            "`{tag}` is a **release candidate** of {what}. \
 It is published for testing and is not a stable release.\n\n"
         ));
     } else if prerelease {
-        body.push_str(&format!(
-            "`{tag}` is a **prerelease** of the official Among Terminal plugins.\n\n"
-        ));
+        body.push_str(&format!("`{tag}` is a **prerelease** of {what}.\n\n"));
     } else {
-        body.push_str(&format!(
-            "`{tag}` is a release of the official Among Terminal plugins.\n\n"
-        ));
+        body.push_str(&format!("`{tag}` is a release of {what}.\n\n"));
     }
     body.push_str(
         "A release is a snapshot of the whole repository: one tag and one catalogue \
@@ -212,10 +218,17 @@ attached to that release, which the links point to.\n\n",
     }
 
     body.push_str("## Install\n\n");
-    body.push_str(
-        "In Among open **Preferences -> Plugins** and add the source **Official plugins for Among Terminal**, \
+    if official {
+        body.push_str(
+            "In Among open **Preferences -> Plugins** and add the source **Official plugins for Among Terminal**, \
 then choose a plugin and review its access request before you enable it.\n\n",
-    );
+        );
+    } else {
+        body.push_str(&format!(
+            "In Among open **Preferences -> Plugins**, use **Inspect repository** under Plugin sources with \
+`{repository}` and add it as a source, then choose a plugin and review its access request before you enable it.\n\n"
+        ));
+    }
     if prerelease {
         body.push_str(
             "To try this prerelease, start Among with `among --plugin-development` and use **Use latest \
@@ -403,7 +416,12 @@ mod tests {
         assert!(text.contains("| `system-status` | 0.2.0 | 1.2 | `status`, `system.metrics` |"));
         assert!(text.contains("[clock-0.2.0-linux-arm64.tar.gz](https://github.com/o/r/releases/download/v0.2.0-rc.1/clock-0.2.0-linux-arm64.tar.gz) (3 KiB)"));
         assert!(text.contains("sha256sum --check --ignore-missing SHA256SUMS"));
-        assert!(text.contains("**Official plugins for Among Terminal**"));
+        assert!(text.contains("of the plugins of `o/r`."), "{text}");
+        assert!(text.contains("**Inspect repository**"));
+        assert!(
+            !text.contains("fficial"),
+            "another repository is not official: {text}"
+        );
         assert!(text.contains("among --plugin-development"));
         assert!(text.contains("[41](https://github.com/o/r/actions/runs/41)"));
         assert!(text.contains(
@@ -411,6 +429,26 @@ mod tests {
         ));
         assert!(text.ends_with(&format!("\n<!--\n{line}-->\n")), "{text}");
         assert_eq!(text.matches(BINDING_PREFIX).count(), 1);
+    }
+
+    #[test]
+    fn only_this_repository_calls_its_plugins_official() {
+        let tag = "v0.2.0-rc.1";
+        let text = render(
+            OFFICIAL_REPOSITORY,
+            &inventory(tag),
+            &catalogue(None),
+            &binding_line(tag),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            text.contains("of the official Among Terminal plugins."),
+            "{text}"
+        );
+        assert!(text.contains("**Official plugins for Among Terminal**"));
+        assert!(!text.contains("Preparation run"));
     }
 
     #[test]
