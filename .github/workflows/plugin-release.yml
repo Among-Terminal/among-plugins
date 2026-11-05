@@ -543,6 +543,14 @@ jobs:
             exit 1
           fi
           "$tool" release-binding "$inventory" "$WORKFLOW_REF" "$RUN_ID" binding
+          # The description people read, made from the same inventory and
+          # catalogue; the binding line the checks compare stays in it, inside
+          # an HTML comment at its end.
+          prepared_run=-
+          if [ "$PREPARED" = true ]; then prepared_run="$PREPARED_RUN"; fi
+          "$tool" release-notes "$GITHUB_REPOSITORY" "$inventory" release/assets/among-plugins.json \
+            binding "$channel" "$prepared_run" notes.md
+          cat notes.md
           resolved=$("$tool" resolve-tag "$REPOSITORY_ID" "$TAG")
           test "$resolved" = "$PIN" || { echo "tag $TAG moved to $resolved from $PIN" >&2; exit 1; }
           # Checks a published release against the whole expected snapshot.
@@ -577,12 +585,14 @@ jobs:
               exit 0
             fi
             "$tool" verify-release "$channel" resume release.json "$inventory" binding > missing.txt
+            # A draft of an earlier attempt may carry only the binding line.
+            gh api -X PATCH "repositories/$REPOSITORY_ID/releases/$id" -F body=@notes.md > /dev/null
           else
             # Drafts cannot be latest; publishing below makes a stable release
             # latest, while a prerelease never becomes latest.
             gh api -X POST "repositories/$REPOSITORY_ID/releases" \
               -f tag_name="$TAG" -F draft=true -F prerelease="$PRERELEASE" \
-              -f name="$TAG" -F body=@binding > release.json
+              -f name="$TAG" -F body=@notes.md > release.json
             id=$(jq -r .id release.json)
             (cd release/assets && ls) > missing.txt
           fi

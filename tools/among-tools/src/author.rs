@@ -2974,3 +2974,60 @@ mod admission_tests {
         .is_err());
     }
 }
+
+#[cfg(test)]
+mod body_binding_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn line() -> String {
+        format!(
+            "{BINDING_PREFIX}{}",
+            serde_json::to_string(&Binding {
+                repository_id: 7,
+                workflow_ref: "o/r/.github/workflows/w.yml@refs/tags/v1".into(),
+                run_id: 3,
+                tag: "v1.0.0".into(),
+                commit: "b".repeat(40),
+                inventory_sha256: "f".repeat(64),
+            })
+            .unwrap()
+        )
+    }
+
+    fn found(body: &str) -> Result<Binding> {
+        body_binding(&json!({ "body": body }))
+    }
+
+    #[test]
+    fn a_bare_line_and_a_line_inside_an_html_comment_are_the_same_binding() {
+        let line = line();
+        let bare = found(&format!("{line}\n")).unwrap();
+        let hidden = found(&format!("Readable text.\n\n<!--\n{line}\n-->\n")).unwrap();
+        assert_eq!(bare, hidden);
+        assert_eq!(hidden.run_id, 3);
+    }
+
+    #[test]
+    fn two_bindings_or_none_are_refused_wherever_they_stand() {
+        let line = line();
+        let two = found(&format!("<!--\n{line}\n-->\n{line}\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(two.contains("more than one binding"), "{two}");
+        let two_hidden = found(&format!("<!--\n{line}\n{line}\n-->\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(two_hidden.contains("more than one binding"), "{two_hidden}");
+        let none = found("Readable text only.\n<!--\nnot a binding\n-->\n")
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("carries no binding"), "{none}");
+        // The text of a description may quote the prefix mid-line without
+        // making a second binding: only a line that starts with it counts.
+        found(&format!(
+            "Quoting {BINDING_PREFIX} mid-line.\n<!--\n{line}\n-->\n"
+        ))
+        .unwrap();
+    }
+}

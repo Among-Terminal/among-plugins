@@ -374,6 +374,16 @@ jobs:
           test "$(jq '.assets | length' release/inventory.json)" -eq 5
           "$tool" release-binding release/inventory.json owner/repo/.github/workflows/release.yml@refs/tags/v1.0.0 1 binding
           grep -q '^among-release-binding: {' binding
+          # The description people read: the binding line stays byte for byte
+          # the one the release check compares with, alone on a line inside an
+          # HTML comment at the very end, and appears nowhere else.
+          "$tool" release-notes owner/repo release/inventory.json release/assets/among-plugins.json binding stable - notes.md
+          grep -qF 'sha256sum --check --ignore-missing SHA256SUMS' notes.md
+          grep -qF 'fixture-status-1.0.0-linux-amd64.tar.gz' notes.md
+          test "$(grep -c '^among-release-binding: ' notes.md)" -eq 1
+          test "$(tail -n 3 notes.md | head -n 1)" = '<!--'
+          test "$(tail -n 1 notes.md)" = '-->'
+          tail -n 2 notes.md | head -n 1 | cmp - binding
           refuse() {
             reason="$1"; shift
             if "$@" 2> refusal.txt; then echo "accepted: $*"; exit 1; fi

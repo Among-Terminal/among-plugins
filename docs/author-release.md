@@ -203,6 +203,7 @@ rather than the 30 the asset limit would allow.
 among-tools author-packages <source-root> <native-binaries> <vendor> <repository-id> <new-output>
 among-tools author-catalogue <amd64-build> <arm64-build> <repository-id> <tag> <revision> <new-output>
 among-tools release-binding <inventory.json> <workflow-ref> <run-id> <new-output>
+among-tools release-notes <owner/name> <inventory.json> <catalogue.json> <binding> stable|prerelease <prepared-run-id>|- <new-output>
 among-tools prepared-run <run.json> <artifact.json> <repository-id> <source> <run-id> <artifact-id> <workflow-ref>
 among-tools prepared-inventory <prepared-directory> <repository-id> <revision> <tag> <approved-sha256sums-digest> <new-inventory>
 among-tools verify-release stable|prerelease resume|draft|published <release.json> <inventory.json> <binding> [<latest.json>]
@@ -222,10 +223,25 @@ the plugin, so check mode fails there too: a host would not admit a package
 installed from that fork either.
 
 `author-catalogue` refuses builds whose repository, revision, plugin set,
-manifest bytes or archives differ from the expected values. A draft created by
-the workflow carries one `among-release-binding:` line in its body; a later
-run resumes only a draft of the same run with that binding and never replaces
-assets, moves tags or deletes releases.
+manifest bytes or archives differ from the expected values.
+
+The release description is text for people, made by `release-notes` from the
+same inventory and catalogue as the assets: what the release is (a release
+candidate says so plainly), a table of the plugins with version, API,
+required features and the package links per architecture, how to install and
+verify, and the source commit and workflow runs. It refuses a description in
+which a package of the inventory is not linked exactly once or a linked
+package is not in the inventory. A plugin carried over from an earlier release
+links to that release's file.
+
+A draft created by the workflow carries one `among-release-binding:` line at
+the very end of that description, alone on a line between `<!--` and `-->`, so
+GitHub does not show it. The line is the one `release-binding` writes, byte for
+byte. A later run resumes only a draft of the same run with that binding
+(refreshing the description of the draft) and never replaces assets, moves
+tags or deletes releases. The check reads every line that starts with the
+prefix, so exactly one such line must exist in the description; none, or two,
+is refused.
 
 ## When a run stops
 

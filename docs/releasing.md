@@ -237,6 +237,12 @@ Which release is "the previous release" depends on the tag being prepared:
 4. Install it with the application's development mode (`--plugin-development`, "Use
    latest prerelease" for the repository).
 
+Every release, a candidate included, gets a description written for people by
+`among-tools release-notes` from the release's own inventory and catalogue (see
+[author-release.md](author-release.md#commands)). A candidate says plainly that it is for
+testing. The machine binding that the release checks compare stays in the description
+unchanged, alone on a line inside an HTML comment at its end, which GitHub does not render.
+
 A fix after a candidate changes a plugin, and the candidate is then the previous release for
 the next candidate, so the next release pull request raises that plugin's version; make
 another candidate (`--rc N+1`).
