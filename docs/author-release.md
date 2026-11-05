@@ -177,9 +177,13 @@ The official repository has a manual caller,
 Its default `publish: false` prepares the event commit. After separate owner
 approval, dispatch that same caller at the approved tag with `publish: true` and
 all three prepared inputs. It refuses absent inputs instead of falling back to a
-fresh build. There is no tag-push publication trigger. The caller and the checks
-workflow pin the same reviewed reusable-tool commit, so preparation and publication
-check the same tool revision even when the plugin source is a later commit.
+fresh build. There is no tag-push publication trigger. The caller's preparation and
+publication jobs pin the same reviewed reusable-tool commit, so they
+check the same tool revision even when the plugin source is a later commit. The
+checks workflow calls the repository's own copy of the reusable workflow and needs
+no pin. A pin names a commit that is already on the default branch, so raising it
+is its own pull request, merged before the release tag is created: the workflow
+file of the tag is the one that runs.
 Changing that tool pin requires new source review and preparation.
 
 ## What a release contains
