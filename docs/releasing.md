@@ -154,9 +154,8 @@ Only then it creates the single tag `v<label>` on the commit, with the workflow 
 existing tag at the same commit is confirmed, a tag anywhere else fails the run, and a tag is
 never moved. A tag created this way starts no `push` workflow, and this workflow starts none:
 the preparation and the publication stay manual runs of `Official plugin candidate` on the
-tag. (The workflow does not dispatch it, because the pinned release workflow of that file
-does not carry unchanged plugins over yet; raising that pin to a commit that does is a
-separate change.) If another release is published between the checks and the tag job, the
+tag. (The workflow does not dispatch it: the owner decides when a snapshot is prepared and
+published.) If another release is published between the checks and the tag job, the
 check against "the previous release as it is now" fails and no tag is made; the release pull
 request is then rebuilt on the new state.
 
